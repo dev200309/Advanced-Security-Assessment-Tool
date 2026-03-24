@@ -76,11 +76,19 @@ BANNER = f"""
 """
 
 # Color definitions
+# General Status Markers
 INFO = Fore.BLUE + "[*]" + Style.RESET_ALL
 SUCCESS = Fore.GREEN + "[+]" + Style.RESET_ALL
 WARNING = Fore.YELLOW + "[!]" + Style.RESET_ALL
 CRITICAL = Fore.RED + "[!!]" + Style.RESET_ALL
 PROGRESS = Fore.CYAN + "[>]" + Style.RESET_ALL
+
+# Vulnerability Markers (Special Finding Markers)
+V_CRITICAL = f"{Fore.RED}{Back.BLACK}{Style.BRIGHT}[CRITICAL ☠]{Style.RESET_ALL}"
+V_HIGH     = f"{Fore.RED}[HIGH ✖]{Style.RESET_ALL}"
+V_MEDIUM   = f"{Fore.YELLOW}[MEDIUM ⚠]{Style.RESET_ALL}"
+V_LOW      = f"{Fore.BLUE}[LOW ℹ]{Style.RESET_ALL}"
+V_INFO     = f"{Fore.CYAN}[INFO •]{Style.RESET_ALL}"
 
 # Common subdomains wordlist
 SUBDOMAINS_WORDLIST = [
@@ -289,9 +297,20 @@ class RiskRating:
             RiskRating.HIGH: Fore.RED,
             RiskRating.MEDIUM: Fore.YELLOW,
             RiskRating.LOW: Fore.BLUE,
-            RiskRating.INFO: Fore.WHITE
+            RiskRating.INFO: Fore.CYAN
         }
         return colors.get(rating, Fore.WHITE)
+
+    @staticmethod
+    def marker(rating):
+        markers = {
+            RiskRating.CRITICAL: V_CRITICAL,
+            RiskRating.HIGH: V_HIGH,
+            RiskRating.MEDIUM: V_MEDIUM,
+            RiskRating.LOW: V_LOW,
+            RiskRating.INFO: V_INFO
+        }
+        return markers.get(rating, INFO)
 
 class Finding:
     """Class to store individual findings"""
@@ -319,8 +338,8 @@ class Finding:
         }
     
     def __str__(self):
-        color = RiskRating.color(self.risk_rating)
-        return f"{color}[{self.risk_rating}]{Style.RESET_ALL} {self.title}\n    Description: {self.description}\n    Remediation: {self.remediation}"
+        marker = RiskRating.marker(self.risk_rating)
+        return f"{marker} {self.title}\n    Description: {self.description}\n    Remediation: {self.remediation}"
 
 class Report:
     """Class to handle report generation"""
@@ -459,7 +478,7 @@ class NetworkScanner:
                 print(f"{WARNING} Host does not respond to ping (may be firewalled)")
                 
         except socket.gaierror:
-            print(f"{CRITICAL} Could not resolve hostname")
+            print(f"{V_MEDIUM} Could not resolve hostname")
             finding = Finding(
                 "DNS Resolution Failed",
                 f"Could not resolve hostname: {self.target}",
@@ -505,10 +524,12 @@ class NetworkScanner:
                             
                             # Check if it's a dangerous port
                             if int(port) in DANGEROUS_PORTS:
+                                risk = RiskRating.HIGH if port in [21,23,445,3389] else RiskRating.MEDIUM
+                                print(f"{RiskRating.marker(risk)} Dangerous port detected: {port}")
                                 finding = Finding(
                                     f"Dangerous port open: {port}",
                                     f"Port {port} ({service}) is open. This service is known to have security risks.",
-                                    RiskRating.HIGH if port in [21,23,445,3389] else RiskRating.MEDIUM,
+                                    risk,
                                     f"Close the port if not needed. If required, ensure it's properly secured and behind firewall.",
                                     "Network"
                                 )
@@ -559,6 +580,7 @@ class NetworkScanner:
                     
                     # Check for sensitive information in banner
                     if any(keyword in banner.lower() for keyword in ['root', 'admin', 'password', 'vulnerable']):
+                        print(f"{V_MEDIUM} Sensitive information in banner on port {port}")
                         finding = Finding(
                             f"Sensitive information in banner on port {port}",
                             f"Service banner reveals potentially sensitive information: {banner[:200]}",
@@ -658,6 +680,7 @@ class NetworkScanner:
             
             # Telnet check
             if port == 23 or 'telnet' in service:
+                print(f"{V_HIGH} Telnet service detected on port {port}")
                 finding = Finding(
                     "Telnet Service Exposed",
                     "Telnet transmits data in cleartext and is inherently insecure",
@@ -673,6 +696,7 @@ class NetworkScanner:
             
             # Default SSH port check
             if port == 22 and 'ssh' in service:
+                print(f"{V_LOW} SSH on default port 22")
                 finding = Finding(
                     "SSH on Default Port",
                     "SSH service running on default port 22",
@@ -700,7 +724,7 @@ class NetworkScanner:
                 response = sock.recv(1024).decode('utf-8', errors='ignore')
                 
                 if '230' in response:  # Login successful
-                    print(f"{CRITICAL} FTP anonymous login allowed on port {port_info['port']}")
+                    print(f"{V_HIGH} FTP anonymous login allowed on port {port_info['port']}")
                     finding = Finding(
                         "FTP Anonymous Access Allowed",
                         f"FTP server on port {port_info['port']} allows anonymous login",
@@ -740,7 +764,7 @@ class NetworkScanner:
                 if response[39] & 0x08:  # Check if SMB signing is required
                     print(f"{SUCCESS} SMB signing is enabled")
                 else:
-                    print(f"{CRITICAL} SMB signing appears to be disabled")
+                    print(f"{V_HIGH} SMB signing appears to be disabled")
                     finding = Finding(
                         "SMB Signing Disabled",
                         f"SMB server on port {port_info['port']} does not require packet signing",
@@ -890,7 +914,7 @@ class SubdomainScanner:
                     zone = dns.zone.from_xfr(dns.query.xfr(ns_ip, self.domain, timeout=5))
                     
                     if zone:
-                        print(f"{CRITICAL} Zone transfer successful from {ns_name} ({ns_ip})!")
+                        print(f"{V_HIGH} Zone transfer successful from {ns_name} ({ns_ip})!")
                         
                         # Extract records
                         records = []
@@ -1068,7 +1092,7 @@ class SubdomainScanner:
                                     print(f"{INFO} {subdomain} -> {service_name} (responds)")
                             except:
                                 # Service doesn't respond - potential takeover
-                                print(f"{CRITICAL} {subdomain} -> {service_name} (POTENTIAL TAKEOVER!)")
+                                print(f"{V_HIGH} {subdomain} -> {service_name} (POTENTIAL TAKEOVER!)")
                                 self.takeover_vulnerable.append({
                                     'subdomain': subdomain,
                                     'service': service_name,
@@ -1311,7 +1335,7 @@ class WebScanner:
             response = self.session.get(robots_url)
             
             if response.status_code == 200:
-                print(f"{WARNING} robots.txt found:")
+                print(f"{V_MEDIUM} robots.txt found:")
                 disallowed = []
                 for line in response.text.split('\n'):
                     if line.lower().startswith('disallow'):
@@ -1366,7 +1390,7 @@ class WebScanner:
                         elif '<html' not in content_lower: is_valid = True
                         
                         if is_valid:
-                            print(f"{CRITICAL} Sensitive file exposed: {file_path}")
+                            print(f"{V_HIGH} Sensitive file exposed: {file_path}")
                             
                             finding = Finding(
                                 f"Sensitive File Exposed: {file_path}",
@@ -1422,7 +1446,7 @@ class WebScanner:
         
         for header, info in security_headers.items():
             if header not in self.headers:
-                print(f"{WARNING} Missing security header: {header}")
+                print(f"{RiskRating.marker(info['risk'])} Missing security header: {header}")
                 
                 finding = Finding(
                     f"Missing Security Header: {header}",
@@ -1448,7 +1472,7 @@ class WebScanner:
                 if response.status_code == 200:
                     # Check if directory listing is enabled
                     if 'Index of' in response.text:
-                        print(f"{CRITICAL} Directory listing enabled: {directory} (Status: {response.status_code})")
+                        print(f"{V_HIGH} Directory listing enabled: {directory} (Status: {response.status_code})")
                         
                         finding = Finding(
                             "Directory Listing Enabled",
@@ -1473,7 +1497,7 @@ class WebScanner:
                     if content_lower != self.error_baseline:
                         # Additional validation specifically for an admin panel looking form
                         if '<input' in content_lower and ('password' in content_lower or 'type="password"' in content_lower or 'login' in content_lower):
-                            print(f"{WARNING} Admin panel accessible: {admin_panel} (Status: {response.status_code})")
+                            print(f"{V_HIGH} Admin panel accessible: {admin_panel} (Status: {response.status_code})")
                             
                             finding = Finding(
                                 "Admin Panel Exposed",
@@ -1496,7 +1520,7 @@ class WebScanner:
                     test_url = urljoin(self.target, f'/test-{int(time.time())}.txt')
                     response = self.session.request(method, test_url)
                     if response.status_code in [200, 201, 204]:
-                        print(f"{CRITICAL} HTTP method {method} is allowed! (Status: {response.status_code})")
+                        print(f"{V_HIGH} HTTP method {method} is allowed! (Status: {response.status_code})")
                         finding = Finding(
                             f"Dangerous HTTP Method Allowed: {method}",
                             f"The server allows {method} requests which could lead to security issues via file creation/deletion",
@@ -1509,7 +1533,7 @@ class WebScanner:
                     response = self.session.request(method, self.target)
                     
                     if response.status_code not in [405, 501, 403, 404]:  # Method not allowed/not implemented
-                        print(f"{CRITICAL} HTTP method {method} is allowed! (Status: {response.status_code})")
+                        print(f"{V_HIGH} HTTP method {method} is allowed! (Status: {response.status_code})")
                         
                         finding = Finding(
                             f"Dangerous HTTP Method Allowed: {method}",
@@ -1528,7 +1552,7 @@ class WebScanner:
         
         # Check if HTTPS is used
         if not self.target.startswith('https'):
-            print(f"{CRITICAL} Website does not use HTTPS")
+            print(f"{V_HIGH} Website does not use HTTPS")
             
             finding = Finding(
                 "HTTPS Not Enforced",
@@ -1544,7 +1568,7 @@ class WebScanner:
             try:
                 response = self.session.get(self.target)
                 if 'http://' in response.text:
-                    print(f"{WARNING} Mixed content detected (HTTP resources on HTTPS page)")
+                    print(f"{V_MEDIUM} Mixed content detected (HTTP resources on HTTPS page)")
                     
                     finding = Finding(
                         "Mixed Content Detected",
@@ -1573,7 +1597,7 @@ class WebScanner:
                     days_until_expiry = (expiry_date - datetime.datetime.now()).days
                     
                     if days_until_expiry < 30:
-                        print(f"{CRITICAL} SSL certificate expires in {days_until_expiry} days")
+                        print(f"{V_HIGH} SSL certificate expires in {days_until_expiry} days")
                         
                         finding = Finding(
                             "SSL Certificate Expiring Soon",
@@ -1587,7 +1611,7 @@ class WebScanner:
                     # Check TLS version
                     tls_version = ssock.version()
                     if tls_version in ['TLSv1', 'TLSv1.1']:
-                        print(f"{WARNING} Using outdated TLS version: {tls_version}")
+                        print(f"{V_MEDIUM} Using outdated TLS version: {tls_version}")
                         
                         finding = Finding(
                             "Outdated TLS Version",
@@ -1643,7 +1667,7 @@ class WebScanner:
                     
                     response_text = response.text.lower()
                     if any(error in response_text for error in sql_errors):
-                        print(f"{CRITICAL} Possible SQL Injection in parameter: {param}")
+                        print(f"{V_CRITICAL} Possible SQL Injection in parameter: {param}")
                         
                         finding = Finding(
                             "SQL Injection Vulnerability",
@@ -1667,7 +1691,7 @@ class WebScanner:
                     response = self.session.get(test_url)
                     
                     if payload in response.text and '<script>' in payload:
-                        print(f"{CRITICAL} Possible XSS in parameter: {param}")
+                        print(f"{V_CRITICAL} Possible XSS in parameter: {param}")
                         
                         finding = Finding(
                             "Cross-Site Scripting (XSS) Vulnerability",
@@ -1703,7 +1727,7 @@ class WebScanner:
                     if output_injected or (elapsed_time > 4.5 and 'sleep' in payload):
                         # Use a more accurate warning for time-based vs output-based
                         vuln_detail = "Time-Based OS Command Injection detected" if elapsed_time > 4.5 else "OS Command Injection detected via output"
-                        print(f"{CRITICAL} Possible {vuln_detail} in parameter: {param}")
+                        print(f"{V_CRITICAL} Possible {vuln_detail} in parameter: {param}")
                         
                         finding = Finding(
                             "OS Command Injection Vulnerability",
@@ -1718,7 +1742,7 @@ class WebScanner:
                         
                 except requests.exceptions.Timeout:
                     if 'sleep' in payload:
-                        print(f"{CRITICAL} Possible Time-based Command Injection (Timeout) in parameter: {param}")
+                        print(f"{V_CRITICAL} Possible Time-based Command Injection (Timeout) in parameter: {param}")
                         finding = Finding(
                             "Time-Based Command Injection Vulnerability",
                             f"Parameter '{param}' caused a server timeout, likely executing: {payload}",
@@ -1745,7 +1769,7 @@ class WebScanner:
                     # Since 7*7 is 49, if the evaluated mathematical formula evaluates to 49 
                     # while the payload input itself vanished, SSTI is highly probable.
                     if '49' in response.text and payload not in response.text:
-                        print(f"{CRITICAL} Server-Side Template Injection in parameter: {param}")
+                        print(f"{V_CRITICAL} Server-Side Template Injection in parameter: {param}")
                         
                         finding = Finding(
                             "Server-Side Template Injection",
@@ -1779,7 +1803,7 @@ class WebScanner:
                 response = self.session.get(url)
                 
                 if response.status_code == 200:
-                    print(f"{WARNING} Debug endpoint exposed: {endpoint}")
+                    print(f"{V_HIGH} Debug endpoint exposed: {endpoint}")
                     
                     finding = Finding(
                         "Debug Endpoint Exposed",
@@ -1834,7 +1858,7 @@ class WebScanner:
                         
                         # Check if login successful (based on response)
                         if response.status_code == 200 and ('welcome' in response.text.lower() or 'dashboard' in response.text.lower()):
-                            print(f"{CRITICAL} Default credentials working: {username}/{password}")
+                            print(f"{V_CRITICAL} Default credentials working: {username}/{password}")
                             
                             finding = Finding(
                                 "Default Credentials Working",
@@ -1859,7 +1883,7 @@ class WebScanner:
             
             if 'access-control-allow-origin' in response.headers:
                 if response.headers['access-control-allow-origin'] == '*':
-                    print(f"{WARNING} CORS misconfiguration: Wildcard origin allowed")
+                    print(f"{V_MEDIUM} CORS misconfiguration: Wildcard origin allowed")
                     
                     finding = Finding(
                         "CORS Misconfiguration",
@@ -1882,7 +1906,7 @@ class WebScanner:
                 response = self.session.get(test_url, allow_redirects=False)
                 
                 if response.status_code in [301, 302] and 'evil.com' in response.headers.get('Location', ''):
-                    print(f"{WARNING} Open redirect vulnerability in parameter: {param}")
+                    print(f"{V_MEDIUM} Open redirect vulnerability in parameter: {param}")
                     
                     finding = Finding(
                         "Open Redirect Vulnerability",
@@ -1912,7 +1936,7 @@ class WebScanner:
                 response = self.session.get(url)
                 
                 if response.status_code == 200:
-                    print(f"{WARNING} Dependency file exposed: {dep_file}")
+                    print(f"{V_MEDIUM} Dependency file exposed: {dep_file}")
                     
                     finding = Finding(
                         f"Dependency File Exposed: {dep_file}",
@@ -1943,7 +1967,7 @@ class WebScanner:
                 
                 for version_range, vuln_info in vulnerable_versions.items():
                     if jquery_version < version_range.replace('<', ''):
-                        print(f"{WARNING} jQuery version {jquery_version} may be vulnerable")
+                        print(f"{V_MEDIUM} jQuery version {jquery_version} may be vulnerable")
                         
                         finding = Finding(
                             "Vulnerable jQuery Version",
@@ -1974,7 +1998,7 @@ class WebScanner:
                     issues.append("Domain not specified")
                 
                 if issues:
-                    print(f"{WARNING} Cookie '{cookie.name}' has security issues: {', '.join(issues)}")
+                    print(f"{V_MEDIUM if 'HttpOnly' in str(issues) else V_LOW} Cookie '{cookie.name}' has security issues: {', '.join(issues)}")
                     
                     finding = Finding(
                         "Insecure Session Cookie",
@@ -1993,7 +2017,7 @@ class WebScanner:
                 
                 # 1. Missing anti-CSRF token check on login
                 if 'csrf' not in form_str and 'authenticity_token' not in form_str and 'token' not in form_str:
-                    print(f"{WARNING} Login form missing anti-CSRF token")
+                    print(f"{V_MEDIUM} Login form missing anti-CSRF token")
                     finding = Finding("Missing Anti-CSRF Token on Login", "The login form appears to lack an unpredictable anti-CSRF token.", RiskRating.MEDIUM, "Implement unpredictable anti-CSRF tokens for all state-changing requests, including login forms.", "Web")
                     self.report.add_finding(finding)
                 
@@ -2006,7 +2030,7 @@ class WebScanner:
                     response2 = self.session.post(form_action, data=data2)
                     
                     if response1.text != response2.text:
-                        print(f"{WARNING} Possible username enumeration detected via error message diff")
+                        print(f"{V_MEDIUM} Possible username enumeration detected via error message diff")
                         finding = Finding("Username Enumeration Possible", "Login form reveals whether a username exists or not via error message differences.", RiskRating.MEDIUM, "Return generic error messages for both invalid username and password.", "Web")
                         self.report.add_finding(finding)
                 except:
@@ -2027,7 +2051,7 @@ class WebScanner:
                         resp = self.session.post(form_action, data=data, allow_redirects=False)
                         # If bypass works, server likely redirects (301/302) to a dashboard instead of returning back to login
                         if resp.status_code in [301, 302] and 'login' not in resp.headers.get('Location', '').lower():
-                            print(f"{CRITICAL} SQLi Auth Bypass successful using: {user_payload}")
+                            print(f"{V_CRITICAL} SQLi Auth Bypass successful using: {user_payload}")
                             finding = Finding("SQL Injection Authentication Bypass", f"Successfully bypassed login using payload: {user_payload}", RiskRating.CRITICAL, "Use parameterized queries or prepared statements.", "Web")
                             self.report.add_finding(finding)
                             break
@@ -2042,7 +2066,7 @@ class WebScanner:
                         data = {'username': user, 'password': pwd}
                         resp = self.session.post(form_action, data=data, allow_redirects=False)
                         if resp.status_code in [301, 302] and 'login' not in resp.headers.get('Location', '').lower():
-                            print(f"{CRITICAL} Default Credentials accepted: {user}:{pwd}")
+                            print(f"{V_CRITICAL} Default Credentials accepted: {user}:{pwd}")
                             finding = Finding("Default Credentials Preserved", f"Login accepted default system credentials: {user}:{pwd}", RiskRating.CRITICAL, "Change default credentials immediately.", "Web")
                             self.report.add_finding(finding)
                             break
@@ -2062,7 +2086,7 @@ class WebScanner:
                             break
                     
                     if not locked_out:
-                        print(f"{WARNING} Missing Brute-Force/Lockout protection on Login")
+                        print(f"{V_HIGH} Missing Brute-Force/Lockout protection on Login")
                         finding = Finding("Missing Login Brute-Force Protection", "Application allowed 12 rapid consecutive failed authentication attempts without blocking or throttling.", RiskRating.HIGH, "Implement account lockout mechanisms, IP rate-limiting, or CAPTCHA.", "Web")
                         self.report.add_finding(finding)
                 except:
@@ -2084,7 +2108,7 @@ class WebScanner:
                 src = script['src']
                 if not script.get('integrity') and not script.get('crossorigin'):
                     if src.startswith('http') and not src.startswith(urlparse(self.target).netloc):
-                        print(f"{WARNING} External script without SRI: {src}")
+                        print(f"{V_LOW} External script without SRI: {src}")
                         
                         finding = Finding(
                             "Missing Subresource Integrity",
@@ -2125,7 +2149,7 @@ class WebScanner:
                 if response.status_code >= 500:
                     response_text = response.text.lower()
                     if any(indicator in response_text for indicator in stack_indicators):
-                        print(f"{WARNING} Verbose error page detected")
+                        print(f"{V_MEDIUM} Verbose error page detected")
                         
                         finding = Finding(
                             "Verbose Error Messages",
@@ -2170,7 +2194,7 @@ class WebScanner:
                     # Check for signs of SSRF
                     for indicator in ssrf_indicators:
                         if indicator in response_text and indicator not in baseline_text:
-                            print(f"{CRITICAL} Possible SSRF found in parameter: {param}")
+                            print(f"{V_CRITICAL} Possible SSRF found in parameter: {param}")
                             print(f"       -> Exact Location: {test_url}")
                             
                             finding = Finding(
@@ -2194,7 +2218,7 @@ class WebScanner:
         
         # Check for clickjacking
         if 'X-Frame-Options' not in self.headers:
-            print(f"{WARNING} Site may be vulnerable to clickjacking")
+            print(f"{V_MEDIUM} Site may be vulnerable to clickjacking")
             
             finding = Finding(
                 "Clickjacking Vulnerability",
@@ -2210,7 +2234,7 @@ class WebScanner:
         for form in self.forms:
             enctype = form.get('enctype', '')
             if 'multipart/form-data' in enctype:
-                print(f"{WARNING} File upload form detected")
+                print(f"{V_LOW} File upload form detected")
                 
                 # Test dangerous file extensions
                 dangerous_extensions = ['.php', '.php5', '.phtml', '.asp', '.aspx', '.jsp', '.exe']
@@ -2221,7 +2245,7 @@ class WebScanner:
                         response = self.session.post(urljoin(self.target, form.get('action', '')), files=files)
                         
                         if response.status_code == 200 and 'uploaded' in response.text.lower():
-                            print(f"{CRITICAL} File upload may accept dangerous extension: {ext}")
+                            print(f"{V_CRITICAL} File upload may accept dangerous extension: {ext}")
                             
                             finding = Finding(
                                 "Insecure File Upload",
@@ -2263,7 +2287,7 @@ class WebScanner:
                     
                     traversal_indicators = ['root:x:', 'daemon:x:', 'bin:x:', '[extensions]']
                     if any(indicator in response.text for indicator in traversal_indicators):
-                        print(f"{CRITICAL} Path traversal in parameter: {param}")
+                        print(f"{V_CRITICAL} Path traversal in parameter: {param}")
                         
                         finding = Finding(
                             "Path Traversal Vulnerability",
@@ -2310,7 +2334,7 @@ class APIScanner:
                 url = urljoin(self.target, path)
                 response = self.session.get(url, timeout=5)
                 if response.status_code in [200, 401, 403] and 'application/json' in response.headers.get('Content-Type', ''):
-                    print(f"{WARNING} API Endpoint Discovered: {path} (Status: {response.status_code})")
+                    print(f"{V_MEDIUM} API Endpoint Discovered: {path} (Status: {response.status_code})")
                     finding = Finding("API Endpoint Exposed", f"Exposed API endpoint at {path}", RiskRating.MEDIUM, "Ensure proper authentication and authorization (e.g., BOLA protections) on all API endpoints", "API")
                     self.report.add_finding(finding)
             except:
@@ -2325,7 +2349,7 @@ class APIScanner:
                 url = urljoin(self.target, path)
                 response = self.session.get(url, timeout=5)
                 if response.status_code == 200 and ('swagger' in response.text.lower() or 'openapi' in response.text.lower()):
-                    print(f"{CRITICAL} API Documentation Exposed: {path}")
+                    print(f"{V_HIGH} API Documentation Exposed: {path}")
                     finding = Finding("API Documentation Exposed", f"Swagger/OpenAPI documentation publicly accessible at {path}", RiskRating.HIGH, "Restrict access to API documentation to internal IP addresses or authenticated developers.", "API")
                     self.report.add_finding(finding)
             except:
@@ -2361,7 +2385,7 @@ class CloudScanner:
                 time.sleep(0.1)
                 response = self.session.get(bucket_url, timeout=5)
                 if response.status_code == 200 and 'ListBucketResult' in response.text:
-                    print(f"{CRITICAL} Public S3 Bucket Discovered (Listable): {bucket_url}")
+                    print(f"{V_CRITICAL} Public S3 Bucket Discovered (Listable): {bucket_url}")
                     finding = Finding("Public S3 Bucket", f"S3 Bucket '{bucket_name}' allows public directory listing.", RiskRating.CRITICAL, "Configure S3 bucket ACL to block public access.", "Cloud")
                     self.report.add_finding(finding)
                 elif response.status_code == 403 and 'AccessDenied' in response.text:
@@ -2486,9 +2510,10 @@ Examples:
         # Print summary
         print(f"\n{SUCCESS} Scan completed in {time.time() - self.start_time:.2f} seconds")
         print(f"{INFO} Findings Summary:")
-        for risk, count in self.report.scan_summary.items():
-            color = RiskRating.color(risk)
-            print(f"  {color}{risk}: {count}{Style.RESET_ALL}")
+        for risk in [RiskRating.CRITICAL, RiskRating.HIGH, RiskRating.MEDIUM, RiskRating.LOW, RiskRating.INFO]:
+            count = self.report.scan_summary.get(risk, 0)
+            marker = RiskRating.marker(risk)
+            print(f"  {marker} {risk}: {count}")
     
     def run(self):
         """Main execution method"""
