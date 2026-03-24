@@ -2,7 +2,7 @@
 Advanced Security Assessment Tool (ASAT) – A powerful multi-phase automated scanner for Network, Subdomain, Web App, API, and Cloud vulnerability testing. Features 5-phase reconnaissance, OWASP Top 10 mapping, and detailed JSON/Text reporting. Happy Hacking!
 
 
-# Happy Hacking - Advanced Security Assessment Tool (ASAT) v2.0
+# Happy Hacking - Advanced Security Assessment Tool (ASAT) 
 
 **Happy Hacking (ASAT)** is a multi-phase automated security assessment tool designed for network, subdomain, and web application testing.
 
