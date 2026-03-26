@@ -1,124 +1,111 @@
-# Advanced-Security-Assessment-Tool
-Advanced Security Assessment Tool (ASAT) – A powerful multi-phase automated scanner for Network, Subdomain, Web App, API, and Cloud vulnerability testing. Features 5-phase reconnaissance, OWASP Top 10 mapping, and detailed JSON/Text reporting. Happy Hacking!
+# 🦅 Happy Hacking - Advanced Security Assessment Tool (ASAT)
 
+[![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Status](https://img.shields.io/badge/status-active-brightgreen.svg)](https://github.com/inso-somani/Advanced-Security-Assessment-Tool)
+[![License](https://img.shields.io/badge/license-MIT-red.svg)](LICENSE)
 
-# Happy Hacking - Advanced Security Assessment Tool (ASAT) 
+**ASAT** is an elite, multi-phase automated security scanner designed to hunt for deep-seated vulnerabilities across Network, Web, API, and Cloud infrastructures. It transforms raw data into actionable security intelligence using a modular strike-team architecture.
 
-**Happy Hacking (ASAT)** is a multi-phase automated security assessment tool designed for network, subdomain, and web application testing.
+---
 
-## Prerequisites
+## 🚀 Key Features
 
-The tool requires **Python 3** and the following dependencies to function properly.
-Furthermore, the system requires `nmap` for advanced port scanning and OS detection.
+*   **⚡ High-Speed Recon**: Parallelized subdomain discovery and port scanning.
+*   **🌐 Deep Web Analysis**: Targeted injection testing (SSTI, CRLF, SQLi, SSRF) and Request Smuggling.
+*   **🛡️ Multi-Cloud Hunter**: Native support for AWS, Azure, GCP, DigitalOcean, and Firebase exposure checks.
+*   **🔗 API Strike Force**: Advanced GraphQL introspection, JWT analysis, and Secret leakage scans.
+*   **📊 Dynamic Reporting**: Real-time severity-marked logs with detailed text and JSON report generation.
 
-### 1. Install System Dependencies
+---
+
+## 🛠️ Installation & Setup
+
+### 1. System Requirements
+The system requires `nmap` for advanced fingerprinting and network level checks.
+
 ```bash
-# For Debian/Ubuntu-based systems
-sudo apt update
+# Debian/Ubuntu
+sudo apt update && sudo apt install nmap -y
+
+# Kali Linux
 sudo apt install nmap -y
 ```
 
-### 2. Install Python Dependencies
+### 2. Python Environment
+Install the core strike-suite dependencies:
+
 ```bash
 pip3 install python-nmap requests dnspython whois colorama beautifulsoup4
 ```
 
 ---
 
-## Usage Guide
+## 🎮 Command Center
 
-Because the script utilizes raw sockets and SYN scanning features of `nmap`, it must be run with **Root/Sudo privileges**.
+| Command | Action |
+| :--- | :--- |
+| `-t`, `--target` | **(Required)** The target domain or IP to assess. |
+| `--phase` | Select specific strikes (`1-5`). Can be multiple. |
+| `--all` | Launch the full 5-phase offensive. |
+| `-o`, `--output` | Destination for the mission report. |
+| `--format` | Choose your intel format: `txt` (default) or `json`. |
+| `-v`, `--verbose` | Activate high-detail combat logging. |
 
-### Basic Usage
-
-**Run a complete scan (All Phases)** against a target:
+### Battle Examples:
 ```bash
-sudo python3 happyhacking.py -t <target> --all
-```
-*Example:* `sudo python3 happyhacking.py -t example.com --all`
+# Full 5-Phase Assault
+sudo python3 happyhacking.py -t example.com --all
 
-### Available Arguments
+# API & Cloud Targeted Strike (Phases 4 & 5)
+sudo python3 happyhacking.py -t target.com --phase 4 --phase 5
 
-| Argument | Long Argument | Description |
-| :--- | :--- | :--- |
-| `-t` | `--target` | **(Required)** Target domain or IP address. |
-| | `--phase` | Scan phase to run (`1`=Network, `2`=Subdomain, `3`=Web, `4`=API, `5`=Cloud). Can be specified multiple times. |
-| | `--all` | Run all scan phases (`1`, `2`, `3`, `4`, and `5`). |
-| `-o` | `--output` | Output file for the report. If not specified, a timestamped file is generated automatically. |
-| | `--format` | Report format (Choices: `txt`, `json`. Default: `txt`). |
-| `-v` | `--verbose` | Enable verbose output for more detailed logs during execution. |
-| | `--no-banner`| Suppress the banner display at startup. |
-| `-h` | `--help` | Show the help message and exit. |
-
----
-
-## Scan Phases Explained
-
-The tool is divided into five major scan phases that you can trigger individually or together:
-
-### Phase 1: Network Scan (`--phase 1`)
-Performs network reconnaissance and scanning.
-- **Host Discovery**: Ping sweeps and DNS resolution.
-- **Port Scanning**: Comprehensive `SYN` scan using `nmap` (1-65535 ports).
-- **Banner Grabbing**: Fetches service banners and detects sensitive information.
-- **Network Info**: WHOIS, GeoIP, and Traceroute.
-- **Vulnerability Checks**: Anonymous FTP, SMB signing, plaintext protocols (Telnet).
-- **Firewall/IDS Detection**: Inconsistent port states inspection.
-
-*Example:* `sudo python3 happyhacking.py -t example.com --phase 1`
-
-### Phase 2: Subdomain Scan (`--phase 2`)
-Performs subdomain discovery and analysis.
-- Connects to sources like DNS zone transfers and bruteforce mechanisms to find mapped assets.
-- Checks for potential subdomain takeover risks.
-
-*Example:* `sudo python3 happyhacking.py -t example.com --phase 2`
-
-### Phase 3: Web Application Scan (`--phase 3`)
-Performs active and passive web vulnerability checks.
-- Checks for advanced Injections: SQL Injection (SQLi), Server-Side Template Injection (SSTI), OS Command Injection (Time & Output based), Cross-Site Scripting (XSS), SSRF, and Path Traversal.
-- Performs rigorous Authentication Bypass attempts (SQLi, Default Credentials, Rate Limiting/Lockout checks).
-- Validates misconfigurations: Missing security headers, exposed sensitive info/admin panels (with exact HTTP status codes), clickjacking, and file uploads.
-
-*Example:* `sudo python3 happyhacking.py -t example.com --phase 3`
-
-### Phase 4: API Security Scan (`--phase 4`)
-Targets hidden and undocumented API routes.
-- Discovers hidden/unauthorized JSON endpoints (e.g. `/api/v1/`).
-- Hunts for publicly exposed documentation files like `swagger.json` and `openapi.yaml`.
-
-*Example:* `sudo python3 happyhacking.py -t example.com --phase 4`
-
-### Phase 5: Cloud Infrastructure & Bucket Hunting (`--phase 5`)
-Reconnaissance layer hunting for misconfigured public cloud storage.
-- Dynamically searches for poorly-secured AWS S3 buckets linked to the target domain (e.g. `target-backup.s3.amazonaws.com`).
-- Assesses and reports if any discovered buckets allow unauthorized public directory listing.
-
-*Example:* `sudo python3 happyhacking.py -t example.com --phase 5`
-
-### Combining Phases
-You can combine multiple phases if you don't want to run all of them:
-```bash
-sudo python3 happyhacking.py -t example.com --phase 1 --phase 3
+# Fast Network Discovery
+sudo python3 happyhacking.py -t 192.168.1.1 --phase 1 -v
 ```
 
 ---
 
-## Reporting
+## 📂 The 5 Strike Phases
 
-By default, the tool outputs a `.txt` report file with a timestamp in the current directory if run successfully.
-You can format it as JSON or specify a custom filename.
+### 🛰️ Phase 1: Network Recon
+*   **Discovery**: Host resolution, reverse DNS, and GeoIP positioning.
+*   **Scanning**: Full 65535-port SYN scan with OS fingerprinting.
+*   **Encrypted Intel**: SSL/TLS cipher analysis (identifying weak RC4, DES, export ciphers).
+*   **Email Security**: Comprehensive record audit (SPF, DKIM, DMARC).
 
-**Save as JSON format:**
-```bash
-sudo python3 happyhacking.py -t example.com --all --format json -o output_report.json
-```
+### 📡 Phase 2: Subdomain Strike
+*   **Discovery**: Multi-source subdomain hunting and brute-force mapping.
+*   **Takeover Hunter**: Detection of dangling DNS records and potential hijack opportunities.
 
-**Save as a specific Text file:**
-```bash
-sudo python3 happyhacking.py -t example.com --all -o scan_results.txt
-```
+### 🌎 Phase 3: Web Offensive
+*   **Injection Lab**: Advanced SSTI, OS Command Injection, SSRF, and SQLi testing.
+*   **Ambush Detection**: HTTP Request Smuggling (CL.TE), CRLF, and Host Header Injection.
+*   **Persistence Check**: Web Cache Poisoning and WebSocket security analysis.
+
+### 🧬 Phase 4: API Deep Scan
+*   **Schema Exposure**: GraphQL Introspection and mutation discovery.
+*   **Token Audit**: Deep JWT analysis (alg:none, weak HMAC, payload leakage).
+*   **Access Control**: CORS wildcard checks, Rate Limiting, and Mass Assignment testing.
+*   **Secret Hunter**: Automated regex detection for AWS, Stripe, and GitHub keys in responses.
+
+### ☁️ Phase 5: Cloud Hunter
+*   **Multi-Cloud**: AWS S3 (with Write-Access test), Azure Blob, GCP Storage, and DO Spaces discovery.
+*   **DB Exposure**: Firebase Realtime and Firestore leakage testing.
+*   **CDN Recon**: CloudFront origin leak and HSTS header validation.
 
 ---
 
-> ⚠️ **DISCLAIMER:** This tool is for authorized security testing only! Unauthorized use against systems you don't own is illegal! By using this tool, you agree to use it responsibly and ethically.
+## 🧪 Severity Indicators
+
+ASAT uses a high-visibility danger-marking system for real-time analysis:
+
+*   `[☠ CRITICAL]` - Immediate action required (RCE, Secret Leaks).
+*   `[☢ HIGH]` - Severe risk (Injections, Smuggling).
+*   `[⚠ MEDIUM]` - Significant vulnerability (CORS misconfig, Weak SSL/TLS).
+*   `[ℹ LOW]` - Minor security improvement (Missing headers).
+
+---
+
+> ⚠️ **LEGAL DISCLAIMER:** This tool is for authorized security testing only! Unauthorized use against systems you do not own is strictly illegal and unethical. The developer assumes no liability for misuse.
+
+**Happy Hacking! 🦅**

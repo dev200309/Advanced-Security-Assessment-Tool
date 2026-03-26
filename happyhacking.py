@@ -361,7 +361,7 @@ class Report:
         report.append("\n")
         
         # Findings by Phase
-        phases = ['Network', 'Subdomain', 'Web']
+        phases = ['Network', 'Subdomain', 'Web', 'API', 'Cloud']
         for phase in phases:
             phase_findings = [f for f in self.findings if f.phase == phase]
             if phase_findings:
@@ -421,6 +421,15 @@ class NetworkScanner:
         
         # Firewall Detection
         self.firewall_detection()
+        
+        # SSL/TLS Cipher Analysis
+        self.check_ssl_ciphers()
+        
+        # DNSSEC Validation
+        self.check_dnssec()
+        
+        # Email Security (SPF/DKIM/DMARC)
+        self.check_email_security()
         
         print(f"{SUCCESS} Phase 1 completed")
     
@@ -803,6 +812,355 @@ class NetworkScanner:
                 
         except Exception as e:
             print(f"{WARNING} Firewall detection failed: {str(e)}")
+
+    def check_ssl_ciphers(self):
+        """Analyze SSL/TLS configuration for weak ciphers and protocols"""
+        print(f"\n{INFO} SSL/TLS Cipher Analysis")
+        
+        hostname = self.target
+        port = 443
+        
+        # Weak cipher patterns to detect
+        weak_ciphers = {
+            'RC4': 'RC4 is broken and should never be used',
+            'DES': 'DES is broken (56-bit key) and easily cracked',
+            '3DES': 'Triple DES is deprecated due to Sweet32 attack',
+            'NULL': 'NULL cipher provides no encryption',
+            'EXPORT': 'EXPORT ciphers use intentionally weak keys (40/56-bit)',
+            'anon': 'Anonymous ciphers provide no authentication',
+            'MD5': 'MD5 for HMAC is deprecated',
+        }
+        
+        # Deprecated protocols to test
+        deprecated_protocols = [
+            (ssl.PROTOCOL_TLSv1, 'TLSv1.0'),
+            (ssl.PROTOCOL_TLSv1_1, 'TLSv1.1'),
+        ] if hasattr(ssl, 'PROTOCOL_TLSv1') else []
+        
+        # Test deprecated protocols
+        for protocol_const, protocol_name in deprecated_protocols:
+            try:
+                context = ssl.SSLContext(protocol_const)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                with socket.create_connection((hostname, port), timeout=5) as sock:
+                    with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                        print(f"{WARNING} Deprecated protocol supported: {protocol_name}")
+                        
+                        finding = Finding(
+                            f"Deprecated TLS Protocol Supported: {protocol_name}",
+                            f"The server supports {protocol_name} which has known vulnerabilities "
+                            f"(POODLE, BEAST, etc.) and is deprecated by all major browsers.",
+                            RiskRating.MEDIUM,
+                            f"Disable {protocol_name} on the server. Use TLS 1.2 or TLS 1.3 only.",
+                            "Network"
+                        )
+                        self.report.add_finding(finding)
+            except (ssl.SSLError, ConnectionRefusedError, OSError):
+                if self.verbose:
+                    print(f"{SUCCESS} {protocol_name} is disabled (good)")
+            except Exception:
+                pass
+        
+        # Get current cipher suite info using default context
+        try:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            
+            with socket.create_connection((hostname, port), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    cipher = ssock.cipher()
+                    tls_version = ssock.version()
+                    
+                    if cipher:
+                        cipher_name = cipher[0]
+                        cipher_bits = cipher[2]
+                        
+                        print(f"{INFO} Negotiated: {tls_version} / {cipher_name} ({cipher_bits}-bit)")
+                        
+                        # Check for weak cipher
+                        for weak_pattern, description in weak_ciphers.items():
+                            if weak_pattern.lower() in cipher_name.lower():
+                                print(f"{CRITICAL} Weak cipher in use: {cipher_name}")
+                                
+                                finding = Finding(
+                                    f"Weak SSL/TLS Cipher: {cipher_name}",
+                                    f"The server negotiated a weak cipher: {cipher_name} ({cipher_bits}-bit). "
+                                    f"Reason: {description}.",
+                                    RiskRating.HIGH,
+                                    "1. Disable all weak ciphers in the server configuration.\n"
+                                    "    2. Use only AEAD ciphers (AES-GCM, ChaCha20-Poly1305).\n"
+                                    "    3. Follow Mozilla SSL Configuration Generator recommendations.",
+                                    "Network"
+                                )
+                                self.report.add_finding(finding)
+                                break
+                        
+                        # Check for weak key size
+                        if cipher_bits < 128:
+                            print(f"{WARNING} Weak cipher key size: {cipher_bits}-bit")
+                            finding = Finding(
+                                "Weak SSL/TLS Key Size",
+                                f"Negotiated cipher {cipher_name} uses only {cipher_bits}-bit key, "
+                                f"which is below the recommended 128-bit minimum.",
+                                RiskRating.HIGH,
+                                "Configure the server to require minimum 128-bit cipher key sizes.",
+                                "Network"
+                            )
+                            self.report.add_finding(finding)
+                    
+                    # Check SSL certificate details
+                    cert = ssock.getpeercert()
+                    if cert:
+                        # Certificate chain validation
+                        subject = dict(x[0] for x in cert.get('subject', []))
+                        issuer = dict(x[0] for x in cert.get('issuer', []))
+                        
+                        cn = subject.get('commonName', '')
+                        issuer_cn = issuer.get('commonName', '')
+                        
+                        # Self-signed check
+                        if cn == issuer_cn:
+                            print(f"{WARNING} Self-signed SSL certificate detected")
+                            finding = Finding(
+                                "Self-Signed SSL Certificate",
+                                f"The SSL certificate is self-signed (CN={cn}, Issuer={issuer_cn}). "
+                                f"Self-signed certificates are not trusted by browsers and can facilitate MITM attacks.",
+                                RiskRating.MEDIUM,
+                                "Use a certificate from a trusted Certificate Authority (CA).",
+                                "Network"
+                            )
+                            self.report.add_finding(finding)
+                        
+                        # CN mismatch check
+                        if cn and hostname not in cn and '*' not in cn:
+                            san = cert.get('subjectAltName', [])
+                            san_domains = [entry[1] for entry in san if entry[0] == 'DNS']
+                            if hostname not in san_domains:
+                                print(f"{WARNING} SSL certificate CN mismatch: {cn} != {hostname}")
+                                finding = Finding(
+                                    "SSL Certificate CN Mismatch",
+                                    f"Certificate Common Name '{cn}' does not match hostname '{hostname}'. "
+                                    f"This causes browser security warnings and may indicate misconfiguration.",
+                                    RiskRating.MEDIUM,
+                                    "Ensure the SSL certificate covers the correct hostname(s).",
+                                    "Network"
+                                )
+                                self.report.add_finding(finding)
+                                
+        except Exception as e:
+            if self.verbose:
+                print(f"{WARNING} SSL cipher analysis failed: {str(e)}")
+    
+    def check_dnssec(self):
+        """Check if DNSSEC is enabled for the domain"""
+        print(f"\n{INFO} Checking DNSSEC Configuration")
+        
+        try:
+            # Query for DNSKEY record
+            try:
+                dnskey_answers = dns.resolver.resolve(self.target, 'DNSKEY', raise_on_no_answer=False)
+                if dnskey_answers and len(dnskey_answers) > 0:
+                    print(f"{SUCCESS} DNSSEC is enabled (DNSKEY records found)")
+                    
+                    finding = Finding(
+                        "DNSSEC Enabled",
+                        f"DNSSEC is properly configured for {self.target}",
+                        RiskRating.INFO,
+                        "N/A - DNSSEC is properly configured",
+                        "Network"
+                    )
+                    self.report.add_finding(finding)
+                    return
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                pass
+            
+            # Query for DS record (delegation signer)
+            try:
+                ds_answers = dns.resolver.resolve(self.target, 'DS', raise_on_no_answer=False)
+                if ds_answers and len(ds_answers) > 0:
+                    print(f"{SUCCESS} DNSSEC DS records found")
+                    return
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                pass
+            
+            # No DNSSEC found
+            print(f"{WARNING} DNSSEC is NOT enabled for {self.target}")
+            finding = Finding(
+                "DNSSEC Not Enabled",
+                f"DNSSEC is not configured for {self.target}. Without DNSSEC, "
+                f"DNS responses can be spoofed or tampered with in transit, "
+                f"enabling cache poisoning and man-in-the-middle attacks.",
+                RiskRating.LOW,
+                "1. Enable DNSSEC at your DNS registrar/provider.\n"
+                "    2. Sign your DNS zone with DNSSEC keys.\n"
+                "    3. Publish DS records to the parent zone.",
+                "Network"
+            )
+            self.report.add_finding(finding)
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"{WARNING} DNSSEC check failed: {str(e)}")
+    
+    def check_email_security(self):
+        """Check SPF, DKIM, and DMARC DNS records for email security"""
+        print(f"\n{INFO} Checking Email Security (SPF/DKIM/DMARC)")
+        
+        domain = self.target
+        
+        # --- SPF Check ---
+        try:
+            txt_records = dns.resolver.resolve(domain, 'TXT')
+            spf_found = False
+            spf_record = ""
+            
+            for record in txt_records:
+                record_text = str(record).strip('"')
+                if record_text.startswith('v=spf1'):
+                    spf_found = True
+                    spf_record = record_text
+                    print(f"{SUCCESS} SPF Record: {record_text[:100]}")
+                    
+                    # Check for overly permissive SPF
+                    if '+all' in record_text:
+                        print(f"{CRITICAL} SPF record uses +all (allows ANY server to send email)")
+                        finding = Finding(
+                            "SPF Record Overly Permissive (+all)",
+                            f"SPF record uses '+all' which permits any mail server to send email "
+                            f"on behalf of {domain}. This completely defeats SPF protection.",
+                            RiskRating.HIGH,
+                            "Change +all to -all (hard fail) or ~all (soft fail) in the SPF record.",
+                            "Network"
+                        )
+                        finding.add_evidence(f"SPF: {record_text}")
+                        self.report.add_finding(finding)
+                    elif '~all' in record_text:
+                        print(f"{INFO} SPF uses ~all (softfail) — consider using -all")
+                    elif '-all' in record_text:
+                        print(f"{SUCCESS} SPF uses -all (hardfail) — good")
+                    break
+            
+            if not spf_found:
+                print(f"{WARNING} No SPF record found for {domain}")
+                finding = Finding(
+                    "Missing SPF Record",
+                    f"No SPF (Sender Policy Framework) record found for {domain}. "
+                    f"Without SPF, anyone can send emails impersonating your domain.",
+                    RiskRating.MEDIUM,
+                    "1. Create a TXT record with 'v=spf1' followed by authorized mail servers.\n"
+                    "    2. End the record with '-all' to reject unauthorized senders.",
+                    "Network"
+                )
+                self.report.add_finding(finding)
+                
+        except dns.resolver.NoAnswer:
+            print(f"{WARNING} No TXT records found for {domain}")
+        except Exception as e:
+            if self.verbose:
+                print(f"{WARNING} SPF check failed: {str(e)}")
+        
+        # --- DMARC Check ---
+        try:
+            dmarc_domain = f"_dmarc.{domain}"
+            dmarc_records = dns.resolver.resolve(dmarc_domain, 'TXT')
+            dmarc_found = False
+            
+            for record in dmarc_records:
+                record_text = str(record).strip('"')
+                if 'v=DMARC1' in record_text or 'v=dmarc1' in record_text.lower():
+                    dmarc_found = True
+                    print(f"{SUCCESS} DMARC Record: {record_text[:100]}")
+                    
+                    # Check DMARC policy
+                    if 'p=none' in record_text.lower():
+                        print(f"{WARNING} DMARC policy is 'none' (monitoring only, no enforcement)")
+                        finding = Finding(
+                            "DMARC Policy Set to None",
+                            f"DMARC policy for {domain} is set to 'none', meaning failed emails "
+                            f"are still delivered. This provides monitoring but no protection.",
+                            RiskRating.LOW,
+                            "Upgrade DMARC policy from 'p=none' to 'p=quarantine' or 'p=reject'.",
+                            "Network"
+                        )
+                        finding.add_evidence(f"DMARC: {record_text}")
+                        self.report.add_finding(finding)
+                    elif 'p=reject' in record_text.lower():
+                        print(f"{SUCCESS} DMARC policy is 'reject' (strong protection)")
+                    elif 'p=quarantine' in record_text.lower():
+                        print(f"{SUCCESS} DMARC policy is 'quarantine' (good protection)")
+                    break
+            
+            if not dmarc_found:
+                print(f"{WARNING} No DMARC record found")
+                finding = Finding(
+                    "Missing DMARC Record",
+                    f"No DMARC record found for {domain}. Without DMARC, "
+                    f"there is no policy to handle emails that fail SPF/DKIM checks, "
+                    f"making email spoofing significantly easier.",
+                    RiskRating.MEDIUM,
+                    "1. Create a TXT record at _dmarc.{domain}.\n"
+                    "    2. Start with 'v=DMARC1; p=none; rua=mailto:dmarc@{domain}'.\n"
+                    "    3. Gradually move to p=quarantine then p=reject.",
+                    "Network"
+                )
+                self.report.add_finding(finding)
+                
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            print(f"{WARNING} No DMARC record found for {domain}")
+            finding = Finding(
+                "Missing DMARC Record",
+                f"No DMARC record found for {domain}.",
+                RiskRating.MEDIUM,
+                "Configure a DMARC TXT record at _dmarc.{domain}.",
+                "Network"
+            )
+            self.report.add_finding(finding)
+        except Exception as e:
+            if self.verbose:
+                print(f"{WARNING} DMARC check failed: {str(e)}")
+        
+        # --- DKIM Check ---
+        # DKIM selectors are not standardized, try common ones
+        common_selectors = ['default', 'google', 'selector1', 'selector2', 'k1', 'mail', 'dkim', 's1', 's2', 'email']
+        dkim_found = False
+        
+        for selector in common_selectors:
+            try:
+                dkim_domain = f"{selector}._domainkey.{domain}"
+                dkim_records = dns.resolver.resolve(dkim_domain, 'TXT')
+                
+                for record in dkim_records:
+                    record_text = str(record).strip('"')
+                    if 'v=DKIM1' in record_text or 'p=' in record_text:
+                        dkim_found = True
+                        print(f"{SUCCESS} DKIM Record found (selector: {selector})")
+                        if self.verbose:
+                            print(f"    {record_text[:100]}")
+                        break
+                        
+                if dkim_found:
+                    break
+                    
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                continue
+            except Exception:
+                continue
+        
+        if not dkim_found:
+            print(f"{WARNING} No DKIM records found (checked {len(common_selectors)} common selectors)")
+            finding = Finding(
+                "DKIM Not Found",
+                f"No DKIM (DomainKeys Identified Mail) records found for {domain} "
+                f"using common selectors. DKIM cryptographically signs emails to prevent tampering.",
+                RiskRating.LOW,
+                "1. Configure DKIM signing on your mail server.\n"
+                "    2. Publish the DKIM public key as a TXT record at selector._domainkey.{domain}.\n"
+                "    3. Common selectors: 'default', 'google', 'selector1'.",
+                "Network"
+            )
+            self.report.add_finding(finding)
 
 # ==================== PHASE 2: SUBDOMAIN SCAN ====================
 class SubdomainScanner:
@@ -1202,6 +1560,13 @@ class WebScanner:
         
         # Additional Checks
         self.additional_checks()
+        
+        # Advanced Injection Checks
+        self.check_host_header_injection()
+        self.check_crlf_injection()
+        self.check_http_request_smuggling()
+        self.check_cache_poisoning()
+        self.check_websocket_endpoints()
         
         print(f"{SUCCESS} Phase 3 completed")
     
@@ -2278,6 +2643,385 @@ class WebScanner:
                 except:
                     pass
 
+    def check_host_header_injection(self):
+        """Check for Host Header Injection (password reset poisoning, cache poisoning)"""
+        print(f"\n{INFO} Checking for Host Header Injection")
+        
+        hostname = urlparse(self.target).hostname
+        
+        # Test 1: Arbitrary Host header
+        test_cases = [
+            {'Host': 'evil.com'},
+            {'Host': f'{hostname}\r\nX-Injected: header'},
+            {'Host': f'{hostname}@evil.com'},
+            {'Host': f'evil.com', 'X-Forwarded-Host': 'evil.com'},
+            {'X-Forwarded-Host': 'evil.com'},
+            {'X-Host': 'evil.com'},
+            {'X-Forwarded-Server': 'evil.com'},
+            {'X-Original-URL': '/admin'},
+            {'X-Rewrite-URL': '/admin'},
+        ]
+        
+        try:
+            # Get baseline response
+            baseline = self.session.get(self.target, timeout=5)
+            baseline_text = baseline.text.lower()
+        except:
+            return
+        
+        for headers in test_cases:
+            try:
+                time.sleep(0.1)
+                response = self.session.get(self.target, headers=headers, timeout=5)
+                response_text = response.text.lower()
+                
+                # Check if evil.com appears in the response (reflected in links, forms, etc.)
+                injected_host = 'evil.com'
+                if injected_host in response_text and injected_host not in baseline_text:
+                    header_name = list(headers.keys())[0]
+                    print(f"{CRITICAL} Host Header Injection via {header_name}!")
+                    
+                    finding = Finding(
+                        "Host Header Injection",
+                        f"The application reflects the injected Host header value '{injected_host}' "
+                        f"in the response via {header_name}. This can enable password reset poisoning, "
+                        f"web cache poisoning, and SSRF attacks.",
+                        RiskRating.HIGH,
+                        "1. Configure the web server to use a whitelist of allowed Host headers.\n"
+                        "    2. Avoid using the Host header to generate URLs in the application.\n"
+                        "    3. Use a fixed SERVER_NAME configuration.\n"
+                        "    4. Ignore X-Forwarded-Host unless explicitly needed behind a trusted proxy.",
+                        "Web"
+                    )
+                    finding.add_evidence(f"Injected header: {headers}")
+                    self.report.add_finding(finding)
+                    break
+                    
+            except:
+                pass
+        
+        # Test 2: Password reset poisoning specifically
+        reset_paths = ['/password/reset', '/forgot-password', '/reset-password',
+                       '/api/password/reset', '/auth/forgot', '/users/password/new']
+        
+        for path in reset_paths:
+            try:
+                url = urljoin(self.target, path)
+                resp = self.session.get(url, timeout=5)
+                if resp.status_code == 200 and ('email' in resp.text.lower() or 'reset' in resp.text.lower()):
+                    # Try submitting with poisoned host
+                    poisoned_resp = self.session.post(
+                        url,
+                        data={'email': 'test@test.com'},
+                        headers={'Host': 'evil.com'},
+                        timeout=5
+                    )
+                    if poisoned_resp.status_code in [200, 302]:
+                        print(f"{WARNING} Password reset form found at {path} (test Host injection manually)")
+                        finding = Finding(
+                            "Password Reset Poisoning Risk",
+                            f"Password reset form at {path} may be vulnerable to Host header poisoning. "
+                            f"If the reset link uses the Host header, attackers can steal reset tokens.",
+                            RiskRating.MEDIUM,
+                            "Generate password reset URLs using a hardcoded, trusted domain.",
+                            "Web"
+                        )
+                        self.report.add_finding(finding)
+                        break
+            except:
+                pass
+    
+    def check_crlf_injection(self):
+        """Check for CRLF Injection (HTTP Response Splitting)"""
+        print(f"\n{INFO} Checking for CRLF Injection")
+        
+        crlf_payloads = [
+            '%0d%0aX-CRLF-Test:injected',
+            '%0aX-CRLF-Test:injected',
+            '%0dX-CRLF-Test:injected',
+            '%E5%98%8A%E5%98%8DX-CRLF-Test:injected',  # Unicode CRLF
+            '\\r\\nX-CRLF-Test:injected',
+        ]
+        
+        # Test in URL path and common redirect parameters
+        test_vectors = []
+        
+        # Test in URL path
+        for payload in crlf_payloads:
+            test_vectors.append(f"{self.target}/{payload}")
+        
+        # Test in redirect parameters
+        redirect_params = ['url', 'redirect', 'next', 'return', 'dest', 'path']
+        for param in redirect_params:
+            for payload in crlf_payloads[:2]:  # Limit payloads per param
+                test_vectors.append(f"{self.target}?{param}={payload}")
+        
+        for test_url in test_vectors:
+            try:
+                time.sleep(0.1)
+                response = self.session.get(test_url, allow_redirects=False, timeout=5)
+                
+                # Check if our injected header appears in response headers
+                if 'X-CRLF-Test' in str(response.headers):
+                    print(f"{CRITICAL} CRLF Injection detected!")
+                    
+                    finding = Finding(
+                        "CRLF Injection (HTTP Response Splitting)",
+                        f"The application allows injection of arbitrary HTTP headers via CRLF characters. "
+                        f"This can enable HTTP response splitting, XSS via injected headers, "
+                        f"cache poisoning, and session fixation.",
+                        RiskRating.HIGH,
+                        "1. Strip or reject CR (\\r) and LF (\\n) characters from all user input.\n"
+                        "    2. Use framework-provided URL redirect functions that auto-sanitize.\n"
+                        "    3. Encode output when setting HTTP headers.",
+                        "Web"
+                    )
+                    finding.add_evidence(f"Payload URL: {test_url}")
+                    finding.add_evidence(f"Injected header found in response")
+                    self.report.add_finding(finding)
+                    return  # Report once
+                    
+            except:
+                pass
+    
+    def check_http_request_smuggling(self):
+        """Detect potential HTTP Request Smuggling (CL.TE / TE.CL)"""
+        print(f"\n{INFO} Checking for HTTP Request Smuggling")
+        
+        hostname = urlparse(self.target).hostname
+        port = 443 if self.target.startswith('https') else 80
+        use_ssl = self.target.startswith('https')
+        
+        try:
+            # Test 1: CL.TE detection — send ambiguous Content-Length + Transfer-Encoding
+            # We send a safe probe that won't cause damage
+            smuggle_request = (
+                f"POST / HTTP/1.1\r\n"
+                f"Host: {hostname}\r\n"
+                f"Content-Type: application/x-www-form-urlencoded\r\n"
+                f"Content-Length: 6\r\n"
+                f"Transfer-Encoding: chunked\r\n"
+                f"\r\n"
+                f"0\r\n"
+                f"\r\n"
+                f"G"
+            )
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            
+            if use_ssl:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                sock = context.wrap_socket(sock, server_hostname=hostname)
+            
+            sock.connect((hostname, port))
+            sock.send(smuggle_request.encode())
+            
+            response = b''
+            try:
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    response += data
+            except socket.timeout:
+                pass
+            finally:
+                sock.close()
+            
+            response_str = response.decode('utf-8', errors='ignore')
+            
+            # Check for indicators of smuggling vulnerability
+            # If server processes both CL and TE differently, it may indicate vulnerability
+            if 'HTTP/1.1 400' in response_str or 'Bad Request' in response_str.lower():
+                # Server rejected the ambiguous request — likely has protections
+                if self.verbose:
+                    print(f"{SUCCESS} Server rejects ambiguous CL/TE requests (good)")
+            elif 'HTTP/1.1 200' in response_str or 'HTTP/1.1 301' in response_str or 'HTTP/1.1 302' in response_str:
+                print(f"{WARNING} Server may accept ambiguous CL/TE headers (potential smuggling)")
+                
+                finding = Finding(
+                    "Potential HTTP Request Smuggling",
+                    "The server accepted a request with both Content-Length and Transfer-Encoding headers "
+                    "without rejecting it. This may indicate vulnerability to HTTP Request Smuggling "
+                    "(CL.TE or TE.CL), which can enable cache poisoning, auth bypass, and request hijacking.",
+                    RiskRating.HIGH,
+                    "1. Configure the web server to reject requests with both CL and TE headers.\n"
+                    "    2. Use HTTP/2 end-to-end where possible.\n"
+                    "    3. Normalize incoming requests at the load balancer/proxy.\n"
+                    "    4. Ensure front-end and back-end servers agree on request boundaries.",
+                    "Web"
+                )
+                self.report.add_finding(finding)
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"{WARNING} HTTP smuggling check failed: {str(e)}")
+    
+    def check_cache_poisoning(self):
+        """Check for Web Cache Poisoning via unkeyed headers"""
+        print(f"\n{INFO} Checking for Web Cache Poisoning")
+        
+        # Unkeyed headers that caches typically ignore but backends may process
+        poison_headers = [
+            {'X-Forwarded-Host': 'evil.com'},
+            {'X-Original-URL': '/admin'},
+            {'X-Rewrite-URL': '/admin'},
+            {'X-Forwarded-Scheme': 'http'},
+            {'X-Forwarded-Proto': 'http'},
+            {'X-Custom-IP-Authorization': '127.0.0.1'},
+            {'X-Forwarded-Port': '4443'},
+            {'X-Forwarded-For': '127.0.0.1'},
+        ]
+        
+        # Cache buster to get fresh responses
+        cache_buster = f"cb={int(time.time())}"
+        
+        try:
+            # Get baseline
+            baseline_url = f"{self.target}?{cache_buster}1"
+            baseline = self.session.get(baseline_url, timeout=5)
+            baseline_text = baseline.text.lower()
+            
+            for headers in poison_headers:
+                try:
+                    time.sleep(0.2)
+                    poisoned_url = f"{self.target}?{cache_buster}2"
+                    response = self.session.get(poisoned_url, headers=headers, timeout=5)
+                    response_text = response.text.lower()
+                    
+                    header_name = list(headers.keys())[0]
+                    header_value = list(headers.values())[0]
+                    
+                    # Check if the injected value appears in response
+                    if header_value.lower() in response_text and header_value.lower() not in baseline_text:
+                        print(f"{WARNING} Cache Poisoning possible via {header_name}")
+                        
+                        # Verify by fetching the same URL without the header
+                        time.sleep(0.5)
+                        verify = self.session.get(poisoned_url, timeout=5)
+                        
+                        if header_value.lower() in verify.text.lower():
+                            # Value persisted — cache was poisoned!
+                            print(f"{CRITICAL} Web Cache Poisoning CONFIRMED via {header_name}!")
+                            finding = Finding(
+                                "Web Cache Poisoning",
+                                f"The cache serves poisoned content injected via the unkeyed header '{header_name}'. "
+                                f"Attackers can inject malicious content that gets cached and served to all users.",
+                                RiskRating.HIGH,
+                                "1. Include security-relevant headers in the cache key.\n"
+                                "    2. Strip or normalize unkeyed headers at the CDN/proxy level.\n"
+                                "    3. Disable caching for sensitive pages.\n"
+                                "    4. Use Vary header to include relevant request headers in cache key.",
+                                "Web"
+                            )
+                            finding.add_evidence(f"Poisoned via: {header_name}: {header_value}")
+                            self.report.add_finding(finding)
+                            return
+                        else:
+                            # Value reflected but not cached
+                            finding = Finding(
+                                "Unkeyed Header Reflection (Potential Cache Poisoning)",
+                                f"The header '{header_name}' is reflected in the response but may not be cached. "
+                                f"If caching is enabled upstream, this could lead to cache poisoning.",
+                                RiskRating.MEDIUM,
+                                "Strip or reject unkeyed headers that influence response content.",
+                                "Web"
+                            )
+                            self.report.add_finding(finding)
+                            return
+                            
+                except:
+                    pass
+                    
+        except Exception as e:
+            if self.verbose:
+                print(f"{WARNING} Cache poisoning check failed: {str(e)}")
+    
+    def check_websocket_endpoints(self):
+        """Discover and test WebSocket endpoints"""
+        print(f"\n{INFO} Checking for WebSocket Endpoints")
+        
+        ws_paths = [
+            '/ws', '/ws/', '/websocket', '/websocket/', '/socket',
+            '/socket.io/', '/sockjs/', '/cable', '/hub', '/signalr',
+            '/realtime', '/live', '/stream', '/events', '/notifications/ws',
+            '/api/ws', '/api/v1/ws', '/api/stream', '/chat/ws'
+        ]
+        
+        hostname = urlparse(self.target).hostname
+        port = 443 if self.target.startswith('https') else 80
+        use_ssl = self.target.startswith('https')
+        
+        found_any = False
+        
+        for ws_path in ws_paths:
+            try:
+                # Send a WebSocket upgrade request
+                upgrade_request = (
+                    f"GET {ws_path} HTTP/1.1\r\n"
+                    f"Host: {hostname}\r\n"
+                    f"Upgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    f"Sec-WebSocket-Version: 13\r\n"
+                    f"Origin: https://evil.com\r\n"
+                    f"\r\n"
+                )
+                
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                
+                if use_ssl:
+                    context = ssl.create_default_context()
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    sock = context.wrap_socket(sock, server_hostname=hostname)
+                
+                sock.connect((hostname, port))
+                sock.send(upgrade_request.encode())
+                
+                response = sock.recv(4096).decode('utf-8', errors='ignore')
+                sock.close()
+                
+                if '101' in response and 'Switching Protocols' in response:
+                    found_any = True
+                    print(f"{WARNING} WebSocket endpoint found: {ws_path}")
+                    
+                    # Check if origin validation is missing
+                    origin_issue = 'evil.com' not in response.lower()  # If evil origin was accepted
+                    
+                    risk = RiskRating.MEDIUM
+                    desc = f"WebSocket endpoint discovered at {ws_path}."
+                    
+                    if 'sec-websocket-accept' in response.lower():
+                        # Upgrade was accepted even with evil.com origin
+                        risk = RiskRating.HIGH
+                        desc += " The endpoint accepted a WebSocket upgrade from an untrusted origin (evil.com), "
+                        desc += "which may enable Cross-Site WebSocket Hijacking (CSWSH)."
+                    
+                    finding = Finding(
+                        "WebSocket Endpoint Discovered",
+                        desc,
+                        risk,
+                        "1. Validate the Origin header on WebSocket upgrade requests.\n"
+                        "    2. Implement authentication on WebSocket connections.\n"
+                        "    3. Use WSS (WebSocket Secure) instead of WS.\n"
+                        "    4. Implement message-level authorization.",
+                        "Web"
+                    )
+                    finding.add_evidence(f"Endpoint: {ws_path}")
+                    self.report.add_finding(finding)
+                    
+            except:
+                pass
+        
+        if not found_any:
+            if self.verbose:
+                print(f"{INFO} No WebSocket endpoints found")
+
 # ==================== PHASE 4: API ====================
 class APIScanner:
     """Phase 4: API Security Scanning"""
@@ -2294,40 +3038,575 @@ class APIScanner:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15"
         ]
         self.session.headers.update({"User-Agent": random.choice(user_agents)})
+        self.discovered_endpoints = []
+        self.collected_responses = []
         
     def run(self):
         print(f"\n{INFO} Starting Phase 4: API Security Scan on {self.target}")
+        
+        # API Discovery
         self.check_api_endpoints()
         self.check_api_docs()
+        
+        # GraphQL Security
+        self.check_graphql_introspection()
+        
+        # Authentication & Authorization
+        self.check_jwt_security()
+        self.check_api_cors()
+        self.check_api_rate_limiting()
+        
+        # Data Exposure
+        self.check_api_key_exposure()
+        self.check_mass_assignment()
+        
         print(f"{SUCCESS} Phase 4 completed")
         
     def check_api_endpoints(self):
+        """Discover exposed API endpoints"""
         print(f"\n{INFO} Checking for exposed API endpoints")
-        api_paths = ['/api/', '/api/v1/', '/api/v2/', '/api/v3/', '/graphql', '/graphql/', '/v1/', '/v2/']
+        api_paths = [
+            '/api/', '/api/v1/', '/api/v2/', '/api/v3/',
+            '/graphql', '/graphql/', '/v1/', '/v2/', '/v3/',
+            '/rest/', '/rest/v1/', '/api/users', '/api/v1/users',
+            '/api/config', '/api/status', '/api/health', '/api/info',
+            '/api/v1/config', '/api/admin', '/api/v1/admin',
+            '/api/debug', '/api/internal', '/api/private',
+            '/api/v1/me', '/api/user/profile', '/api/account'
+        ]
         for path in api_paths:
             try:
                 time.sleep(0.1)
                 url = urljoin(self.target, path)
                 response = self.session.get(url, timeout=5)
-                if response.status_code in [200, 401, 403] and 'application/json' in response.headers.get('Content-Type', ''):
+                content_type = response.headers.get('Content-Type', '')
+                
+                if response.status_code in [200, 401, 403] and ('json' in content_type or 'xml' in content_type):
                     print(f"{WARNING} API Endpoint Discovered: {path} (Status: {response.status_code})")
-                    finding = Finding("API Endpoint Exposed", f"Exposed API endpoint at {path}", RiskRating.MEDIUM, "Ensure proper authentication and authorization (e.g., BOLA protections) on all API endpoints", "API")
+                    self.discovered_endpoints.append({'path': path, 'status': response.status_code, 'response': response})
+                    
+                    # Store responses for later analysis
+                    if response.status_code == 200:
+                        self.collected_responses.append(response)
+                    
+                    risk = RiskRating.MEDIUM
+                    if 'admin' in path or 'internal' in path or 'private' in path or 'debug' in path:
+                        risk = RiskRating.HIGH
+                    
+                    finding = Finding(
+                        "API Endpoint Exposed",
+                        f"Exposed API endpoint at {path} (Status: {response.status_code})",
+                        risk,
+                        "Ensure proper authentication and authorization on all API endpoints. "
+                        "Restrict internal/admin APIs to authorized networks only.",
+                        "API"
+                    )
                     self.report.add_finding(finding)
             except:
                 pass
                 
     def check_api_docs(self):
+        """Check for exposed API documentation"""
         print(f"\n{INFO} Checking for exposed API Documentation (Swagger/OpenAPI)")
-        doc_paths = ['/swagger.json', '/openapi.json', '/api-docs', '/swagger-ui.html', '/v3/api-docs', '/api/swagger.json']
+        doc_paths = [
+            '/swagger.json', '/openapi.json', '/api-docs', '/swagger-ui.html',
+            '/v3/api-docs', '/api/swagger.json', '/swagger-ui/', '/swagger/',
+            '/api/docs', '/docs', '/redoc', '/api/redoc',
+            '/swagger-ui/index.html', '/swagger-resources',
+            '/v2/api-docs', '/api-docs/swagger.json',
+            '/.well-known/openapi.json', '/openapi.yaml'
+        ]
         for path in doc_paths:
             try:
                 time.sleep(0.1)
                 url = urljoin(self.target, path)
                 response = self.session.get(url, timeout=5)
-                if response.status_code == 200 and ('swagger' in response.text.lower() or 'openapi' in response.text.lower()):
+                if response.status_code == 200 and ('swagger' in response.text.lower() or 'openapi' in response.text.lower() or '"paths"' in response.text):
                     print(f"{CRITICAL} API Documentation Exposed: {path}")
-                    finding = Finding("API Documentation Exposed", f"Swagger/OpenAPI documentation publicly accessible at {path}", RiskRating.HIGH, "Restrict access to API documentation to internal IP addresses or authenticated developers.", "API")
+                    
+                    # Try to extract endpoint count
+                    endpoint_count = response.text.count('"paths"')
+                    
+                    finding = Finding(
+                        "API Documentation Exposed",
+                        f"Swagger/OpenAPI documentation publicly accessible at {path}. "
+                        f"This reveals the entire API structure, endpoints, parameters, and data models to attackers.",
+                        RiskRating.HIGH,
+                        "1. Restrict access to API docs to internal networks or authenticated developers.\n"
+                        "    2. If docs must be public, remove sensitive endpoints and schemas.\n"
+                        "    3. Use API gateway to filter documentation access.",
+                        "API"
+                    )
+                    finding.add_evidence(f"URL: {url}")
                     self.report.add_finding(finding)
+            except:
+                pass
+
+    def check_graphql_introspection(self):
+        """Check if GraphQL introspection is enabled (exposes entire schema)"""
+        print(f"\n{INFO} Checking for GraphQL Introspection")
+        
+        graphql_endpoints = ['/graphql', '/graphql/', '/api/graphql', '/gql', '/query', '/v1/graphql']
+        
+        introspection_query = {
+            "query": '{ __schema { types { name fields { name type { name } } } } }'
+        }
+        
+        for endpoint in graphql_endpoints:
+            try:
+                url = urljoin(self.target, endpoint)
+                
+                # Try POST with JSON
+                response = self.session.post(
+                    url,
+                    json=introspection_query,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=5
+                )
+                
+                if response.status_code == 200 and '__schema' in response.text:
+                    print(f"{CRITICAL} GraphQL Introspection ENABLED at {endpoint}")
+                    
+                    # Count exposed types
+                    try:
+                        data = response.json()
+                        type_count = len(data.get('data', {}).get('__schema', {}).get('types', []))
+                    except:
+                        type_count = 'unknown'
+                    
+                    finding = Finding(
+                        "GraphQL Introspection Enabled",
+                        f"GraphQL introspection is enabled at {endpoint}, exposing the entire API schema "
+                        f"including all types ({type_count}), queries, mutations, and data relationships. "
+                        f"Attackers can map the full API surface without guessing.",
+                        RiskRating.HIGH,
+                        "1. Disable introspection in production (set introspection: false).\n"
+                        "    2. Use query depth limiting and complexity analysis.\n"
+                        "    3. Implement field-level authorization.\n"
+                        "    4. Use a GraphQL-aware WAF.",
+                        "API"
+                    )
+                    finding.add_evidence(f"Endpoint: {url}")
+                    finding.add_evidence(f"Exposed types count: {type_count}")
+                    self.report.add_finding(finding)
+                    
+                    # Also check for mutation exposure
+                    mutation_query = {"query": '{ __schema { mutationType { fields { name } } } }'}
+                    try:
+                        mut_resp = self.session.post(url, json=mutation_query, headers={'Content-Type': 'application/json'}, timeout=5)
+                        if mut_resp.status_code == 200 and 'mutationType' in mut_resp.text:
+                            mut_data = mut_resp.json()
+                            mutations = mut_data.get('data', {}).get('__schema', {}).get('mutationType', {})
+                            if mutations and mutations.get('fields'):
+                                mut_names = [f['name'] for f in mutations['fields'][:10]]
+                                print(f"{WARNING} GraphQL mutations exposed: {', '.join(mut_names[:5])}")
+                                finding = Finding(
+                                    "GraphQL Mutations Exposed",
+                                    f"GraphQL mutations are discoverable: {', '.join(mut_names)}",
+                                    RiskRating.HIGH,
+                                    "Implement authentication and authorization on all mutations.",
+                                    "API"
+                                )
+                                self.report.add_finding(finding)
+                    except:
+                        pass
+                    
+                    break  # Found GraphQL, no need to check other endpoints
+                    
+            except:
+                pass
+
+    def check_jwt_security(self):
+        """Analyze JWT tokens found in responses and cookies for security issues"""
+        print(f"\n{INFO} Checking for JWT Token Security Issues")
+        
+        import base64
+        
+        jwt_tokens = []
+        
+        # Collect JWTs from cookies
+        for cookie in self.session.cookies:
+            if cookie.value and cookie.value.count('.') == 2:
+                # Looks like a JWT (three dot-separated parts)
+                jwt_tokens.append(('cookie:' + cookie.name, cookie.value))
+        
+        # Collect JWTs from response headers and bodies
+        for resp in self.collected_responses:
+            # Check Authorization header patterns in response
+            auth_header = resp.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer ') and auth_header.count('.') == 2:
+                jwt_tokens.append(('header:Authorization', auth_header.replace('Bearer ', '')))
+            
+            # Check response body for JWT patterns
+            jwt_pattern = re.findall(r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', resp.text)
+            for token in jwt_pattern[:3]:  # Limit to 3 tokens
+                jwt_tokens.append(('response_body', token))
+        
+        # Also try to get a JWT by hitting common auth endpoints
+        auth_endpoints = ['/api/auth/login', '/api/login', '/auth/token', '/oauth/token', '/api/v1/auth']
+        for endpoint in auth_endpoints:
+            try:
+                url = urljoin(self.target, endpoint)
+                # Send a dummy auth request to see if we get JWT back
+                resp = self.session.post(url, json={'username': 'test', 'password': 'test'}, timeout=5)
+                jwt_pattern = re.findall(r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', resp.text)
+                for token in jwt_pattern[:1]:
+                    jwt_tokens.append(('auth_response', token))
+            except:
+                pass
+        
+        if not jwt_tokens:
+            if self.verbose:
+                print(f"{INFO} No JWT tokens found to analyze")
+            return
+        
+        for source, token in jwt_tokens:
+            try:
+                # Decode JWT header (first part)
+                header_b64 = token.split('.')[0]
+                # Add padding
+                header_b64 += '=' * (4 - len(header_b64) % 4)
+                header_json = base64.urlsafe_b64decode(header_b64)
+                header = json.loads(header_json)
+                
+                # Decode JWT payload (second part)
+                payload_b64 = token.split('.')[1]
+                payload_b64 += '=' * (4 - len(payload_b64) % 4)
+                payload_json = base64.urlsafe_b64decode(payload_b64)
+                payload = json.loads(payload_json)
+                
+                alg = header.get('alg', 'unknown')
+                
+                # Check 1: Algorithm "none"
+                if alg.lower() == 'none':
+                    print(f"{CRITICAL} JWT uses 'none' algorithm (source: {source})")
+                    finding = Finding(
+                        "JWT Algorithm None Attack Possible",
+                        f"JWT token from {source} uses algorithm 'none', allowing signature bypass. "
+                        f"Attackers can forge arbitrary tokens.",
+                        RiskRating.CRITICAL,
+                        "1. Never accept 'none' algorithm.\n"
+                        "    2. Enforce a specific algorithm server-side (e.g., RS256).\n"
+                        "    3. Use a JWT library that rejects 'none' by default.",
+                        "API"
+                    )
+                    self.report.add_finding(finding)
+                
+                # Check 2: Weak algorithm (HS256 with potentially guessable secret)
+                if alg in ['HS256', 'HS384', 'HS512']:
+                    print(f"{WARNING} JWT uses symmetric algorithm: {alg} (source: {source})")
+                    finding = Finding(
+                        "JWT Uses Symmetric Signing Algorithm",
+                        f"JWT from {source} uses {alg}. If the secret key is weak or leaked, "
+                        f"attackers can forge tokens. Asymmetric algorithms (RS256) are preferred.",
+                        RiskRating.MEDIUM,
+                        "1. Use asymmetric algorithms (RS256, ES256) instead.\n"
+                        "    2. If HMAC is required, use a strong random secret (256+ bits).\n"
+                        "    3. Rotate signing keys regularly.",
+                        "API"
+                    )
+                    self.report.add_finding(finding)
+                
+                # Check 3: Token expiration
+                exp = payload.get('exp')
+                if exp is None:
+                    print(f"{WARNING} JWT has no expiration claim (source: {source})")
+                    finding = Finding(
+                        "JWT Missing Expiration",
+                        f"JWT from {source} has no 'exp' claim. Tokens without expiration "
+                        f"remain valid indefinitely if compromised.",
+                        RiskRating.HIGH,
+                        "1. Always set 'exp' claim with a reasonable lifetime.\n"
+                        "    2. Implement token refresh mechanism.\n"
+                        "    3. Maintain a token revocation list.",
+                        "API"
+                    )
+                    self.report.add_finding(finding)
+                elif exp < time.time():
+                    if self.verbose:
+                        print(f"{INFO} JWT is expired (source: {source})")
+                
+                # Check 4: Sensitive data in payload
+                sensitive_keys = ['password', 'secret', 'ssn', 'credit_card', 'cc_number', 'token', 'api_key', 'private_key']
+                found_sensitive = [k for k in payload.keys() if any(s in k.lower() for s in sensitive_keys)]
+                if found_sensitive:
+                    print(f"{WARNING} JWT contains sensitive claims: {found_sensitive} (source: {source})")
+                    finding = Finding(
+                        "JWT Contains Sensitive Data",
+                        f"JWT payload from {source} contains potentially sensitive claims: {', '.join(found_sensitive)}. "
+                        f"JWT payloads are base64 encoded (NOT encrypted) and readable by anyone.",
+                        RiskRating.HIGH,
+                        "1. Never store sensitive data in JWT payloads.\n"
+                        "    2. Use JWE (encrypted JWTs) if payload confidentiality is needed.\n"
+                        "    3. Store sensitive data server-side, reference by ID only.",
+                        "API"
+                    )
+                    self.report.add_finding(finding)
+                    
+            except Exception as e:
+                if self.verbose:
+                    print(f"{WARNING} JWT analysis failed for {source}: {str(e)}")
+
+    def check_api_cors(self):
+        """Check CORS configuration on discovered API endpoints"""
+        print(f"\n{INFO} Checking API CORS Configuration")
+        
+        test_endpoints = [ep['path'] for ep in self.discovered_endpoints[:5]]
+        if not test_endpoints:
+            test_endpoints = ['/api/', '/api/v1/', '/graphql']
+        
+        evil_origins = ['https://evil.com', 'https://attacker.com', 'null']
+        
+        for endpoint in test_endpoints:
+            url = urljoin(self.target, endpoint)
+            for origin in evil_origins:
+                try:
+                    headers = {'Origin': origin}
+                    response = self.session.options(url, headers=headers, timeout=5)
+                    
+                    acao = response.headers.get('Access-Control-Allow-Origin', '')
+                    acac = response.headers.get('Access-Control-Allow-Credentials', '')
+                    
+                    if acao == '*':
+                        print(f"{WARNING} API CORS wildcard at {endpoint}")
+                        finding = Finding(
+                            "API CORS Wildcard Origin",
+                            f"API endpoint {endpoint} allows any origin (*) via CORS. "
+                            f"If the API handles authenticated requests, this allows cross-origin data theft.",
+                            RiskRating.MEDIUM if acac.lower() != 'true' else RiskRating.HIGH,
+                            "1. Restrict CORS to specific trusted domains.\n"
+                            "    2. Never combine wildcard origin with Allow-Credentials.\n"
+                            "    3. Validate Origin header against a whitelist.",
+                            "API"
+                        )
+                        self.report.add_finding(finding)
+                        break
+                    
+                    elif acao == origin and origin != 'null':
+                        print(f"{CRITICAL} API reflects arbitrary origin at {endpoint}")
+                        finding = Finding(
+                            "API CORS Reflects Arbitrary Origin",
+                            f"API endpoint {endpoint} reflects the attacker-controlled Origin header '{origin}' "
+                            f"in Access-Control-Allow-Origin. This defeats the purpose of CORS entirely.",
+                            RiskRating.HIGH,
+                            "1. Do NOT reflect the Origin header blindly.\n"
+                            "    2. Validate against a strict whitelist of allowed origins.\n"
+                            "    3. Return a fixed, trusted origin.",
+                            "API"
+                        )
+                        finding.add_evidence(f"Sent Origin: {origin}")
+                        finding.add_evidence(f"Received ACAO: {acao}")
+                        if acac:
+                            finding.add_evidence(f"Allow-Credentials: {acac}")
+                        self.report.add_finding(finding)
+                        break
+                        
+                    elif acao == 'null':
+                        print(f"{WARNING} API CORS allows 'null' origin at {endpoint}")
+                        finding = Finding(
+                            "API CORS Allows Null Origin",
+                            f"API endpoint {endpoint} allows 'null' as a valid CORS origin. "
+                            f"Sandboxed iframes and local files send 'null' origin, enabling bypass.",
+                            RiskRating.MEDIUM,
+                            "Reject 'null' as a valid CORS origin.",
+                            "API"
+                        )
+                        self.report.add_finding(finding)
+                        break
+                        
+                except:
+                    pass
+
+    def check_api_rate_limiting(self):
+        """Test if API endpoints have rate limiting"""
+        print(f"\n{INFO} Testing API Rate Limiting")
+        
+        test_endpoints = [ep['path'] for ep in self.discovered_endpoints[:3]]
+        if not test_endpoints:
+            test_endpoints = ['/api/', '/api/v1/']
+        
+        for endpoint in test_endpoints:
+            url = urljoin(self.target, endpoint)
+            try:
+                rate_limited = False
+                responses = []
+                
+                # Send 20 rapid requests
+                for i in range(20):
+                    resp = self.session.get(url, timeout=5)
+                    responses.append(resp.status_code)
+                    
+                    # Check for rate limiting indicators
+                    if resp.status_code == 429:
+                        rate_limited = True
+                        break
+                    
+                    # Check rate limit headers
+                    remaining = resp.headers.get('X-RateLimit-Remaining', 
+                               resp.headers.get('X-Rate-Limit-Remaining',
+                               resp.headers.get('RateLimit-Remaining', '')))
+                    if remaining and int(remaining) <= 1:
+                        rate_limited = True
+                        break
+                    
+                    if 'retry-after' in resp.headers:
+                        rate_limited = True
+                        break
+                
+                if rate_limited:
+                    if self.verbose:
+                        print(f"{SUCCESS} Rate limiting detected on {endpoint}")
+                else:
+                    print(f"{WARNING} No rate limiting detected on {endpoint} (sent 20 rapid requests)")
+                    finding = Finding(
+                        "API Missing Rate Limiting",
+                        f"API endpoint {endpoint} accepted 20 rapid consecutive requests without "
+                        f"any rate limiting or throttling. This exposes the API to brute-force attacks, "
+                        f"credential stuffing, and denial of service.",
+                        RiskRating.MEDIUM,
+                        "1. Implement rate limiting (e.g., token bucket or sliding window).\n"
+                        "    2. Return HTTP 429 with Retry-After header when limits are exceeded.\n"
+                        "    3. Use API gateway rate limiting (AWS API GW, Kong, etc.).\n"
+                        "    4. Implement per-user and per-IP rate limits.",
+                        "API"
+                    )
+                    finding.add_evidence(f"All 20 requests returned status codes: {set(responses)}")
+                    self.report.add_finding(finding)
+                    break  # Report once
+                    
+            except:
+                pass
+
+    def check_api_key_exposure(self):
+        """Scan collected API responses for leaked secrets and API keys"""
+        print(f"\n{INFO} Scanning API Responses for Exposed Secrets")
+        
+        # Patterns for common API keys and secrets
+        secret_patterns = {
+            'AWS Access Key': r'AKIA[0-9A-Z]{16}',
+            'AWS Secret Key': r'(?i)aws(.{0,20})?[\'"][0-9a-zA-Z/+]{40}[\'"]',
+            'Google API Key': r'AIza[0-9A-Za-z_-]{35}',
+            'Google OAuth Token': r'ya29\.[0-9A-Za-z_-]+',
+            'Stripe Secret Key': r'sk_live_[0-9a-zA-Z]{24,}',
+            'Stripe Publishable Key': r'pk_live_[0-9a-zA-Z]{24,}',
+            'Slack Token': r'xox[baprs]-[0-9a-zA-Z]{10,}',
+            'GitHub Token': r'gh[pousr]_[A-Za-z0-9_]{36,}',
+            'Mailgun API Key': r'key-[0-9a-zA-Z]{32}',
+            'SendGrid API Key': r'SG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}',
+            'Twilio API Key': r'SK[0-9a-fA-F]{32}',
+            'Private Key Block': r'-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----',
+            'Password Field': r'(?i)["\'](password|passwd|secret|api_key|apikey|access_token|auth_token)["\']:\s*["\'][^"\']{4,}["\']',
+            'Generic Secret': r'(?i)(secret|token|key|api_key|apikey|password)\s*[:=]\s*["\'][a-zA-Z0-9/+=]{16,}["\']',
+            'Firebase Config': r'(?i)firebase[A-Za-z]*\s*[:=]\s*["\'][A-Za-z0-9_-]+["\']',
+        }
+        
+        found_any = False
+        
+        # Scan all collected responses
+        for resp in self.collected_responses:
+            response_text = resp.text
+            for secret_name, pattern in secret_patterns.items():
+                matches = re.findall(pattern, response_text)
+                if matches:
+                    print(f"{CRITICAL} {secret_name} found in API response!")
+                    found_any = True
+                    
+                    # Mask the actual value for safe reporting
+                    masked = str(matches[0])[:8] + '...' + str(matches[0])[-4:] if len(str(matches[0])) > 12 else '***REDACTED***'
+                    
+                    finding = Finding(
+                        f"API Key/Secret Exposed: {secret_name}",
+                        f"A {secret_name} pattern was found in an API response. "
+                        f"Exposed credentials can be used to access third-party services, "
+                        f"escalate privileges, or pivot to other systems.",
+                        RiskRating.CRITICAL,
+                        f"1. Immediately rotate the exposed {secret_name}.\n"
+                        f"    2. Remove secrets from API responses.\n"
+                        f"    3. Store secrets in environment variables or a secret manager.\n"
+                        f"    4. Implement output filtering to prevent secret leakage.",
+                        "API"
+                    )
+                    finding.add_evidence(f"Pattern matched: {secret_name}")
+                    finding.add_evidence(f"Masked value: {masked}")
+                    self.report.add_finding(finding)
+        
+        if not found_any:
+            if self.verbose:
+                print(f"{SUCCESS} No exposed secrets found in API responses")
+
+    def check_mass_assignment(self):
+        """Test for mass assignment vulnerabilities on API endpoints"""
+        print(f"\n{INFO} Testing for Mass Assignment Vulnerabilities")
+        
+        # Common extra fields that shouldn't be user-controllable
+        extra_fields = {
+            'role': 'admin',
+            'is_admin': True,
+            'isAdmin': True,
+            'admin': True,
+            'privilege': 'admin',
+            'permissions': 'all',
+            'user_type': 'admin',
+            'account_type': 'premium',
+            'verified': True,
+            'is_verified': True,
+            'activated': True,
+            'balance': 99999,
+            'credit': 99999
+        }
+        
+        # Test on discovered endpoints that might accept POST/PUT
+        test_endpoints = ['/api/user', '/api/v1/user', '/api/profile', '/api/v1/profile',
+                         '/api/account', '/api/v1/account', '/api/register', '/api/v1/register',
+                         '/api/settings', '/api/v1/settings', '/api/update']
+        
+        for endpoint in test_endpoints:
+            url = urljoin(self.target, endpoint)
+            try:
+                # Send a PATCH/PUT with extra privileged fields
+                for method_func in [self.session.put, self.session.patch]:
+                    try:
+                        test_data = {
+                            'name': 'asat_test_user',
+                            'email': 'test@asat-security.test'
+                        }
+                        test_data.update(extra_fields)
+                        
+                        response = method_func(
+                            url,
+                            json=test_data,
+                            timeout=5
+                        )
+                        
+                        if response.status_code in [200, 201]:
+                            try:
+                                resp_data = response.json()
+                                resp_str = json.dumps(resp_data).lower()
+                                
+                                # Check if privileged fields were accepted
+                                privilege_indicators = ['admin', 'premium', 'verified', '99999']
+                                if any(ind in resp_str for ind in privilege_indicators):
+                                    print(f"{CRITICAL} Mass Assignment possible at {endpoint}")
+                                    finding = Finding(
+                                        "Mass Assignment Vulnerability",
+                                        f"API endpoint {endpoint} accepts and processes privileged fields "
+                                        f"(like role, is_admin) that should not be user-controllable. "
+                                        f"Attackers can escalate privileges by including hidden fields in requests.",
+                                        RiskRating.HIGH,
+                                        "1. Use a whitelist of allowed fields for each endpoint.\n"
+                                        "    2. Never bind request data directly to internal models.\n"
+                                        "    3. Use DTOs (Data Transfer Objects) to filter input.\n"
+                                        "    4. Implement field-level access control.",
+                                        "API"
+                                    )
+                                    finding.add_evidence(f"Endpoint: {url}")
+                                    finding.add_evidence(f"Injected fields: {list(extra_fields.keys())}")
+                                    self.report.add_finding(finding)
+                                    return  # Report once
+                            except:
+                                pass
+                    except:
+                        pass
             except:
                 pass
 
@@ -2343,32 +3622,485 @@ class CloudScanner:
         self.verbose = verbose
         self.session = requests.Session()
         self.session.verify = False
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        # Generate common name variations from the domain
+        self.base_name = self.domain.split('.')[0]
+        self.name_variations = self._generate_name_variations()
+        
+    def _generate_name_variations(self):
+        """Generate common cloud resource name permutations from the domain"""
+        suffixes = [
+            '', '-dev', '-development', '-test', '-testing', '-qa',
+            '-prod', '-production', '-staging', '-stage', '-uat',
+            '-backup', '-backups', '-bak', '-old', '-archive',
+            '-assets', '-static', '-public', '-private', '-internal',
+            '-media', '-images', '-img', '-uploads', '-files', '-docs',
+            '-data', '-db', '-database', '-logs', '-api', '-app',
+            '-web', '-www', '-cdn', '-content', '-config', '-temp',
+            '-reports', '-exports', '-downloads', '-storage'
+        ]
+        return [f"{self.base_name}{s}" for s in suffixes]
         
     def run(self):
+        """Execute all cloud infrastructure scan phases"""
         print(f"\n{INFO} Starting Phase 5: Cloud Infrastructure Scan for {self.domain}")
+        
+        # AWS S3 Bucket Hunting
         self.check_s3_buckets()
+        
+        # S3 Write Access Test
+        self.check_s3_write_access()
+        
+        # Azure Blob Storage
+        self.check_azure_blob()
+        
+        # GCP Storage Buckets
+        self.check_gcp_storage()
+        
+        # DigitalOcean Spaces
+        self.check_digitalocean_spaces()
+        
+        # Firebase Database Exposure
+        self.check_firebase_db()
+        
+        # CloudFront Misconfiguration
+        self.check_cloudfront_misconfig()
+        
         print(f"{SUCCESS} Phase 5 completed")
-        
+    
+    # ---- AWS S3 ----
     def check_s3_buckets(self):
+        """Hunt for publicly listable AWS S3 buckets"""
         print(f"\n{INFO} Hunting for unprotected AWS S3 Buckets")
-        base_name = self.domain.split('.')[0]
-        environments = ['', '-dev', '-test', '-prod', '-staging', '-backup', '-assets', '-public', '-media']
         
-        for env in environments:
-            bucket_name = f"{base_name}{env}"
+        found_buckets = []
+        progress = ProgressIndicator(len(self.name_variations), "Scanning S3 Buckets")
+        
+        for bucket_name in self.name_variations:
             bucket_url = f"http://{bucket_name}.s3.amazonaws.com"
             try:
                 time.sleep(0.1)
                 response = self.session.get(bucket_url, timeout=5)
+                
                 if response.status_code == 200 and 'ListBucketResult' in response.text:
-                    print(f"{CRITICAL} Public S3 Bucket Discovered (Listable): {bucket_url}")
-                    finding = Finding("Public S3 Bucket", f"S3 Bucket '{bucket_name}' allows public directory listing.", RiskRating.CRITICAL, "Configure S3 bucket ACL to block public access.", "Cloud")
+                    print(f"\n{CRITICAL} Public S3 Bucket Discovered (Listable): {bucket_url}")
+                    found_buckets.append(bucket_name)
+                    
+                    # Try to extract some file names from the listing
+                    file_keys = re.findall(r'<Key>(.*?)</Key>', response.text)
+                    
+                    finding = Finding(
+                        "Public S3 Bucket (Listable)",
+                        f"S3 Bucket '{bucket_name}' allows public directory listing, exposing all stored objects.",
+                        RiskRating.CRITICAL,
+                        "1. Enable S3 Block Public Access at account level.\n"
+                        "    2. Review and restrict bucket ACLs and policies.\n"
+                        "    3. Enable S3 access logging for audit.",
+                        "Cloud"
+                    )
+                    if file_keys:
+                        finding.add_evidence(f"Sample files found ({len(file_keys)} total): {', '.join(file_keys[:5])}")
+                    finding.add_evidence(f"URL: {bucket_url}")
                     self.report.add_finding(finding)
+                    
                 elif response.status_code == 403 and 'AccessDenied' in response.text:
                     if self.verbose:
-                        print(f"{INFO} S3 Bucket exists but is private: {bucket_url}")
+                        print(f"\n{INFO} S3 Bucket exists but access denied: {bucket_url}")
+                        
             except:
                 pass
+            finally:
+                progress.update()
+        
+        if not found_buckets:
+            print(f"\n{SUCCESS} No publicly listable S3 buckets found")
+    
+    def check_s3_write_access(self):
+        """Test if any discovered S3 buckets allow public write/upload"""
+        print(f"\n{INFO} Testing S3 Buckets for Write Access")
+        
+        test_key = f"asat-write-test-{int(time.time())}.txt"
+        test_content = "ASAT Security Test - This file was uploaded to verify write permissions. Safe to delete."
+        
+        for bucket_name in self.name_variations[:10]:  # Test top variations only
+            bucket_url = f"http://{bucket_name}.s3.amazonaws.com"
+            try:
+                # First check if bucket exists
+                head_resp = self.session.head(bucket_url, timeout=3)
+                if head_resp.status_code in [403, 200]:
+                    # Attempt PUT upload
+                    put_url = f"{bucket_url}/{test_key}"
+                    put_resp = self.session.put(
+                        put_url,
+                        data=test_content,
+                        headers={'Content-Type': 'text/plain'},
+                        timeout=5
+                    )
+                    
+                    if put_resp.status_code in [200, 201, 204]:
+                        print(f"{CRITICAL} S3 Bucket allows PUBLIC WRITE: {bucket_url}")
+                        
+                        # Try to clean up the test file
+                        try:
+                            self.session.delete(put_url, timeout=3)
+                        except:
+                            pass
+                        
+                        finding = Finding(
+                            "S3 Bucket Public Write Access",
+                            f"S3 Bucket '{bucket_name}' allows unauthenticated file uploads. "
+                            f"Attackers can upload malicious content, deface hosted assets, or use the bucket for malware distribution.",
+                            RiskRating.CRITICAL,
+                            "1. Immediately remove public write ACL from the bucket.\n"
+                            "    2. Enable S3 Block Public Access.\n"
+                            "    3. Audit bucket for unauthorized objects.\n"
+                            "    4. Enable versioning and MFA Delete.",
+                            "Cloud"
+                        )
+                        finding.add_evidence(f"Write test URL: {put_url}")
+                        self.report.add_finding(finding)
+            except:
+                pass
+    
+    # ---- Azure Blob Storage ----
+    def check_azure_blob(self):
+        """Hunt for publicly accessible Azure Blob Storage containers"""
+        print(f"\n{INFO} Hunting for unprotected Azure Blob Storage Containers")
+        
+        common_containers = [
+            'public', 'data', 'files', 'uploads', 'media', 'images',
+            'assets', 'backup', 'backups', 'logs', 'downloads',
+            'static', 'content', 'web', 'docs', 'reports', 'temp',
+            'archive', 'exports', 'config', 'storage', '$web'
+        ]
+        
+        found_any = False
+        # Azure storage account names: use base name variations (max 24 chars, lowercase, no hyphens for account)
+        account_names = [
+            self.base_name.replace('-', '').lower()[:24],
+            f"{self.base_name.replace('-', '').lower()[:20]}dev",
+            f"{self.base_name.replace('-', '').lower()[:19]}prod",
+            f"{self.base_name.replace('-', '').lower()[:18]}stage",
+        ]
+        
+        for account in account_names:
+            if not account or len(account) < 3:
+                continue
+                
+            for container in common_containers:
+                blob_url = f"https://{account}.blob.core.windows.net/{container}?restype=container&comp=list"
+                try:
+                    time.sleep(0.1)
+                    response = self.session.get(blob_url, timeout=5)
+                    
+                    if response.status_code == 200 and 'EnumerationResults' in response.text:
+                        print(f"{CRITICAL} Public Azure Blob Container: https://{account}.blob.core.windows.net/{container}")
+                        found_any = True
+                        
+                        blob_names = re.findall(r'<Name>(.*?)</Name>', response.text)
+                        
+                        finding = Finding(
+                            "Public Azure Blob Storage Container",
+                            f"Azure Storage account '{account}', container '{container}' allows public listing of blobs.",
+                            RiskRating.CRITICAL,
+                            "1. Set container access level to 'Private'.\n"
+                            "    2. Use Shared Access Signatures (SAS) for controlled access.\n"
+                            "    3. Enable Azure Storage analytics logging.",
+                            "Cloud"
+                        )
+                        if blob_names:
+                            finding.add_evidence(f"Sample blobs: {', '.join(blob_names[:5])}")
+                        self.report.add_finding(finding)
+                        break  # Found one container in this account, move to next account
+                        
+                    elif response.status_code == 404:
+                        break  # Account doesn't exist, skip remaining containers
+                        
+                except:
+                    pass
+        
+        if not found_any:
+            if self.verbose:
+                print(f"{SUCCESS} No publicly listable Azure Blob containers found")
+    
+    # ---- GCP Storage ----
+    def check_gcp_storage(self):
+        """Hunt for publicly accessible Google Cloud Storage buckets"""
+        print(f"\n{INFO} Hunting for unprotected GCP Storage Buckets")
+        
+        found_any = False
+        progress = ProgressIndicator(len(self.name_variations), "Scanning GCP Buckets")
+        
+        for bucket_name in self.name_variations:
+            gcp_url = f"https://storage.googleapis.com/{bucket_name}"
+            try:
+                time.sleep(0.1)
+                response = self.session.get(gcp_url, timeout=5)
+                
+                if response.status_code == 200:
+                    # Check if it returns XML listing or actual content
+                    if 'ListBucketResult' in response.text or '<Contents>' in response.text:
+                        print(f"\n{CRITICAL} Public GCP Bucket Discovered (Listable): {gcp_url}")
+                        found_any = True
+                        
+                        file_keys = re.findall(r'<Key>(.*?)</Key>', response.text)
+                        
+                        finding = Finding(
+                            "Public GCP Storage Bucket (Listable)",
+                            f"GCP Storage Bucket '{bucket_name}' allows public directory listing.",
+                            RiskRating.CRITICAL,
+                            "1. Remove 'allUsers' and 'allAuthenticatedUsers' from bucket IAM.\n"
+                            "    2. Use uniform bucket-level access.\n"
+                            "    3. Enable audit logging on the bucket.",
+                            "Cloud"
+                        )
+                        if file_keys:
+                            finding.add_evidence(f"Sample files: {', '.join(file_keys[:5])}")
+                        finding.add_evidence(f"URL: {gcp_url}")
+                        self.report.add_finding(finding)
+                        
+                elif response.status_code == 403:
+                    if self.verbose:
+                        print(f"\n{INFO} GCP Bucket exists but access denied: {gcp_url}")
+                        
+            except:
+                pass
+            finally:
+                progress.update()
+        
+        if not found_any:
+            print(f"\n{SUCCESS} No publicly listable GCP Storage buckets found")
+    
+    # ---- DigitalOcean Spaces ----
+    def check_digitalocean_spaces(self):
+        """Hunt for publicly accessible DigitalOcean Spaces"""
+        print(f"\n{INFO} Hunting for unprotected DigitalOcean Spaces")
+        
+        regions = ['nyc3', 'sfo3', 'ams3', 'sgp1', 'fra1', 'syd1', 'blr1']
+        found_any = False
+        
+        # Only test a subset of name variations for each region to avoid excessive requests
+        test_names = self.name_variations[:12]
+        total = len(test_names) * len(regions)
+        progress = ProgressIndicator(total, "Scanning DO Spaces")
+        
+        for bucket_name in test_names:
+            for region in regions:
+                space_url = f"https://{bucket_name}.{region}.digitaloceanspaces.com"
+                try:
+                    time.sleep(0.1)
+                    response = self.session.get(space_url, timeout=5)
+                    
+                    if response.status_code == 200 and 'ListBucketResult' in response.text:
+                        print(f"\n{CRITICAL} Public DO Space Discovered (Listable): {space_url}")
+                        found_any = True
+                        
+                        file_keys = re.findall(r'<Key>(.*?)</Key>', response.text)
+                        
+                        finding = Finding(
+                            "Public DigitalOcean Space (Listable)",
+                            f"DigitalOcean Space '{bucket_name}' in region '{region}' allows public directory listing.",
+                            RiskRating.CRITICAL,
+                            "1. Disable directory listing on the Space.\n"
+                            "    2. Restrict access using Space-level ACLs.\n"
+                            "    3. Use signed URLs for controlled file access.",
+                            "Cloud"
+                        )
+                        if file_keys:
+                            finding.add_evidence(f"Sample files: {', '.join(file_keys[:5])}")
+                        finding.add_evidence(f"URL: {space_url}")
+                        self.report.add_finding(finding)
+                        break  # Found in this region, skip other regions for this name
+                        
+                except:
+                    pass
+                finally:
+                    progress.update()
+        
+        if not found_any:
+            print(f"\n{SUCCESS} No publicly listable DigitalOcean Spaces found")
+    
+    # ---- Firebase ----
+    def check_firebase_db(self):
+        """Check for exposed Firebase Realtime Databases"""
+        print(f"\n{INFO} Checking for exposed Firebase Realtime Databases")
+        
+        firebase_names = [
+            self.base_name,
+            f"{self.base_name}-app",
+            f"{self.base_name}-prod",
+            f"{self.base_name}-dev",
+            f"{self.base_name}-staging",
+            f"{self.base_name}-api",
+            f"{self.base_name}-web",
+            f"{self.base_name}-default-rtdb",
+        ]
+        
+        found_any = False
+        
+        for fb_name in firebase_names:
+            firebase_url = f"https://{fb_name}.firebaseio.com/.json"
+            try:
+                time.sleep(0.1)
+                response = self.session.get(firebase_url, timeout=5)
+                
+                if response.status_code == 200:
+                    # Check if it returns actual data (not "null")
+                    try:
+                        data = response.json()
+                        if data is not None:
+                            # Firebase DB is open and has data
+                            data_preview = str(data)[:200]
+                            print(f"{CRITICAL} Open Firebase Database: https://{fb_name}.firebaseio.com")
+                            found_any = True
+                            
+                            finding = Finding(
+                                "Firebase Realtime Database Exposed",
+                                f"Firebase database '{fb_name}' is publicly readable without authentication. "
+                                f"This can expose user data, API keys, and application secrets.",
+                                RiskRating.CRITICAL,
+                                "1. Set Firebase Security Rules to restrict read/write access.\n"
+                                "    2. Require authentication for all database operations.\n"
+                                "    3. Audit exposed data for sensitive information.\n"
+                                "    4. Rotate any exposed API keys or secrets.",
+                                "Cloud"
+                            )
+                            finding.add_evidence(f"URL: https://{fb_name}.firebaseio.com/.json")
+                            finding.add_evidence(f"Data preview: {data_preview}")
+                            self.report.add_finding(finding)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                        
+                elif response.status_code == 401:
+                    # Database exists but requires auth — that's good
+                    if self.verbose:
+                        print(f"{SUCCESS} Firebase DB exists but requires auth: {fb_name}")
+                        
+            except:
+                pass
+        
+        # Also check for Firestore REST endpoint
+        for fb_name in firebase_names[:4]:
+            firestore_url = f"https://firestore.googleapis.com/v1/projects/{fb_name}/databases/(default)/documents"
+            try:
+                response = self.session.get(firestore_url, timeout=5)
+                if response.status_code == 200:
+                    print(f"{CRITICAL} Open Firestore Database: {fb_name}")
+                    found_any = True
+                    
+                    finding = Finding(
+                        "Firestore Database Exposed",
+                        f"Firestore database for project '{fb_name}' is publicly readable.",
+                        RiskRating.CRITICAL,
+                        "1. Set Firestore Security Rules to deny unauthorized access.\n"
+                        "    2. Require authentication for document reads.\n"
+                        "    3. Audit all collections for sensitive data.",
+                        "Cloud"
+                    )
+                    finding.add_evidence(f"URL: {firestore_url}")
+                    self.report.add_finding(finding)
+            except:
+                pass
+        
+        if not found_any:
+            if self.verbose:
+                print(f"{SUCCESS} No exposed Firebase databases found")
+    
+    # ---- CloudFront ----
+    def check_cloudfront_misconfig(self):
+        """Check for CloudFront misconfigurations that leak origin server info"""
+        print(f"\n{INFO} Checking for CloudFront / CDN Misconfigurations")
+        
+        try:
+            # Check if target uses CloudFront
+            response = self.session.get(
+                f"https://{self.domain}" if not self.domain.startswith('http') else self.domain,
+                timeout=10,
+                allow_redirects=True
+            )
+            
+            headers = response.headers
+            is_cloudfront = 'cloudfront' in headers.get('Server', '').lower() or \
+                           'cloudfront' in headers.get('Via', '').lower() or \
+                           'x-amz-cf-id' in headers or \
+                           'x-amz-cf-pop' in headers
+            
+            if is_cloudfront:
+                print(f"{INFO} CloudFront CDN detected")
+                
+                # Check 1: Origin header leak via error pages
+                try:
+                    error_url = f"https://{self.domain}/asat-cf-test-{int(time.time())}"
+                    error_resp = self.session.get(error_url, timeout=5)
+                    
+                    # Look for origin server info in error responses
+                    origin_indicators = re.findall(
+                        r'(?:https?://[\w.-]+\.(?:amazonaws|elasticbeanstalk|s3|compute|ec2)\.[\w.-]+)',
+                        error_resp.text
+                    )
+                    
+                    if origin_indicators:
+                        print(f"{WARNING} CloudFront error page leaks origin server info")
+                        finding = Finding(
+                            "CloudFront Origin Server Information Leak",
+                            f"CloudFront error pages expose the origin server address, "
+                            f"allowing attackers to bypass CDN protections.",
+                            RiskRating.MEDIUM,
+                            "1. Configure custom error pages in CloudFront.\n"
+                            "    2. Restrict direct access to origin server via Security Groups.\n"
+                            "    3. Use Origin Access Control (OAC) for S3 origins.",
+                            "Cloud"
+                        )
+                        for origin in origin_indicators[:3]:
+                            finding.add_evidence(f"Leaked origin: {origin}")
+                        self.report.add_finding(finding)
+                except:
+                    pass
+                
+                # Check 2: Missing security headers from CloudFront
+                if 'Strict-Transport-Security' not in headers:
+                    print(f"{WARNING} CloudFront distribution missing HSTS header")
+                    finding = Finding(
+                        "CloudFront Missing HSTS",
+                        "CloudFront distribution does not set Strict-Transport-Security header.",
+                        RiskRating.MEDIUM,
+                        "Add HSTS header via CloudFront Response Headers Policy.",
+                        "Cloud"
+                    )
+                    self.report.add_finding(finding)
+                
+                # Check 3: Insecure TLS policy
+                cf_tls = headers.get('X-Amz-Cf-Pop', '')
+                if cf_tls and self.verbose:
+                    print(f"{INFO} CloudFront POP: {cf_tls}")
+                    
+            else:
+                # Check for other CDNs
+                cdn_headers = {
+                    'cf-ray': 'Cloudflare',
+                    'x-fastly-request-id': 'Fastly',
+                    'x-served-by': 'Fastly/Varnish',
+                    'x-cdn': 'Generic CDN',
+                    'x-akamai-transformed': 'Akamai',
+                }
+                
+                detected_cdn = None
+                for header_key, cdn_name in cdn_headers.items():
+                    if header_key in headers:
+                        detected_cdn = cdn_name
+                        break
+                
+                if detected_cdn:
+                    print(f"{INFO} CDN detected: {detected_cdn}")
+                else:
+                    if self.verbose:
+                        print(f"{INFO} No CDN/CloudFront detected")
+                        
+        except Exception as e:
+            if self.verbose:
+                print(f"{WARNING} CloudFront check failed: {str(e)}")
 
 # ==================== MAIN APPLICATION ====================
 class SecurityAssessmentTool:
