@@ -75,12 +75,19 @@ BANNER = f"""
 {Style.RESET_ALL}
 """
 
-# Color definitions
-INFO = Fore.BLUE + "[*]" + Style.RESET_ALL
-SUCCESS = Fore.GREEN + "[+]" + Style.RESET_ALL
-WARNING = Fore.YELLOW + "[!]" + Style.RESET_ALL
-CRITICAL = Fore.RED + "[!!]" + Style.RESET_ALL
-PROGRESS = Fore.CYAN + "[>]" + Style.RESET_ALL
+# Color and Marker definitions
+INFO        = Fore.CYAN + "[*]" + Style.RESET_ALL
+SUCCESS     = Fore.GREEN + "[✔]" + Style.RESET_ALL
+WARNING     = Fore.YELLOW + "[!]" + Style.RESET_ALL
+ERROR       = Fore.RED + "[✘]" + Style.RESET_ALL
+PROGRESS    = Fore.CYAN + "[→]" + Style.RESET_ALL
+
+# Severity Markers (Danger Aesthetics)
+CRITICAL    = Fore.RED + Back.WHITE + Style.BRIGHT + "[☠ CRITICAL]" + Style.RESET_ALL
+HIGH        = Fore.RED + Style.BRIGHT + "[☢ HIGH]" + Style.RESET_ALL
+MEDIUM      = Fore.YELLOW + Style.BRIGHT + "[⚠ MEDIUM]" + Style.RESET_ALL
+LOW         = Fore.BLUE + Style.BRIGHT + "[ℹ LOW]" + Style.RESET_ALL
+VULN        = Fore.RED + Style.BRIGHT + "[! VULN !]" + Style.RESET_ALL
 
 # Common subdomains wordlist
 SUBDOMAINS_WORDLIST = [
