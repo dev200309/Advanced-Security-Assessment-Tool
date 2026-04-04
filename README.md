@@ -52,6 +52,19 @@ sudo python3 happyhacking.py -t <target> --all
 
 ---
 
+## 🎯 High-Accuracy & False-Positive Prevention
+
+ASAT is engineered with strict, highly specific validation logic to practically eliminate false positive vulnerabilities during scans:
+
+- **Strict Protocol Validation (SMB):** Validates precise `\xffSMB` or `\xfeSMB` magic bytes and packet length before asserting that an SMB signing vulnerability exists.
+- **Definitive File Verification (HTTP PUT):** When testing for HTTP Verb tampering, instead of relying on unreliable 200/201 status codes, ASAT actively attempts to create a unique test file and follows up with a `GET` request to verify successful creation and content persistence.
+- **Accurate Database Error Matching (SQLi):** Avoids broad keyword matching (e.g., "sql" or "driver") that often flags regular web content. Instead, it meticulously matches specific backend exceptions like `"unclosed quotation mark after the character string"` or `"pg_query(): query failed"`.
+- **Context-Aware Payload Reflection (XSS):** Checks the `Content-Type` headers before flagging an embedded `<script>` payload, avoiding false alerts on JSON APIs or `text/plain` pages where browsers inherently refuse to execute XSS.
+- **Baseline Comparison for Auth Bypasses:** Establishes a "baseline failed login" profile. When probing for Authentication Bypass or Default Credentials, ASAT flags an alert *only* if the bypass attempt triggers a different behavior and redirection track than a known-failed generic rejection.
+- **Precise HTML Matching (Directory Listing):** Exclusively flags literal `<title>Index of` and `<h1>Index of` tags instead of loosely matching "Index of" text anywhere on the page.
+
+---
+
 ## Scan Phases Explained
 
 The tool is divided into five major scan phases that you can trigger individually or together:
