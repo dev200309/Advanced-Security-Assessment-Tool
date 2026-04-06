@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and OS specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Project specific temporary & backup files
+happyhacking_monolith_backup.py
+refactor.py
+
+# Ignore automatically generated report files if you don't want them in version control
+# Uncomment below if you want to ignore scan reports
+*.json
+scan_results_*.txt
+asat_report_*.txt
+
+# Ignore python compiled cache files securely
+__pycache__/
+*.pyc
+__pycache__/happyhacking.cpython-312.pyc
+
